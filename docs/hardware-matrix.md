@@ -12,6 +12,13 @@ subsequent behavioral change is considered automated-test-only until it is
 replayed on hardware. Deferred checks should be accumulated for the next
 hardware-validation session rather than blocking testable implementation work.
 
+Phase 2 changed the provider, broker, mixer cadence, report ownership,
+condition-slot allocation, asynchronous output, autocenter, and lifecycle.
+Those changes are **automated-test-only** as of 2026-09-01 even where the
+corresponding Phase 1 behavior was physically verified. The next wheel session
+tests only the new path; no Phase 2 behavior is promoted from this matrix based
+on fakes or profiling alone.
+
 | Physical wheel | Compatibility identity | Native PID | Mode switch | Input | Range | Autocenter | DirectInput FFB x86 | DirectInput FFB x64 | Game/crash/hotplug | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Driving Force GT | C294 / REV_1326 observed | C29A | Passed repeatedly; location-path correlated | 3 axes / 21 buttons / 1 POV | 900° passed at startup and after repeated reconnect | Disabled only | Enumeration passed | Constant, sine, spring, damper, and The Bus passed | The Bus performance/FFB plus calibrated reconnect and range restoration passed; crash lease pending | Experimental |
@@ -67,3 +74,16 @@ test tool/game, and whether the result was repeatable after a cold reconnect.
 - Still required: ETS2, physical gain checks, x86 runtime effect playback, and
   explicit crash-lease timing. Unplug/replug recovery and range restoration
   now pass.
+
+## Deferred Phase 2 DFGT acceptance
+
+- Mode switch, calibration, managed attach initialization, StopAll, 2 ms
+  runtime, range, reconnect, removal, and HID-fault recovery.
+- Low-force constant, ramp, square, sine, triangle, sawtooth-up/down, custom,
+  spring, damper, native friction, and inertia-to-damper mapping.
+- Three simultaneous condition reservations and refusal of a fourth.
+- Gain order, direction, envelope, delay, iterations, finite completion,
+  pause/continue, actuator mute, idle autocenter, and dynamic range boundary.
+- x86/x64 playback plus provider crash, pipe loss, broker termination, 350 ms
+  lease timing, and unplug during output.
+- Ten-minute profiling capture, The Bus, and ETS2 on the new path.

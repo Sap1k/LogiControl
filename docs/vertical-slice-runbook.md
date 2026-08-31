@@ -16,11 +16,10 @@ Visual Studio 2026's bundled CMake is discovered through `vswhere`.
 These commands never open HID for output:
 
 ```powershell
-dotnet run --project .\src\LogiControl.DeviceAgent -c Release -- list --json
-dotnet run --project .\src\LogiControl.DeviceAgent -c Release -- run --observe-only
+dotnet run --project .\src\LogiControl.Broker -c Release -- list --json
 ```
 
-Stop the observer with Ctrl+C. An eligible DFGT must be reported as Logitech
+This command performs enumeration only and opens no HID output. An eligible DFGT must be reported as Logitech
 C294 with a `13xx` revision, joystick usage `0001:0004`, and an output report
 length of at least eight bytes.
 
@@ -42,22 +41,32 @@ To remove it from an elevated shell and restore captured registry branches:
 .\tools\install\Unregister-Development.ps1 -Confirm:$false
 ```
 
-## Run the broker and agent
+## Run the managed broker
 
 ```powershell
 .\tools\run\Start-Development.ps1
 ```
 
-For C294, the agent automatically sends the two native-mode reports after
+For C294, the broker automatically sends the two native-mode reports after
 revision validation. For C29A, it attaches directly. Ctrl+C triggers
-EmergencyStop and terminates the development broker.
+StopAll, closes output, and terminates the development broker.
 
-For provider parsing/IPC diagnostics with every force write suppressed in the
-broker, use `Start-Development.ps1 -SuppressForceWrites`.
+For provider parsing/IPC acceptance without physical enumeration or output,
+use `Start-Development.ps1 -FakeHid`. Add `-Profile` only for per-event
+EventSource capture; aggregate telemetry is always enabled.
+
+From another shell, query or control the running broker with:
+
+```powershell
+dotnet run --project .\src\LogiControl.Broker -c Release -- status
+dotnet run --project .\src\LogiControl.Broker -c Release -- telemetry
+dotnet run --project .\src\LogiControl.Broker -c Release -- settings
+dotnet run --project .\src\LogiControl.Broker -c Release -- emergency-stop
+```
 
 ## DirectInput checks
 
-With the broker and agent running, enumeration is force-free:
+With the broker running, enumeration is force-free:
 
 ```powershell
 .\out\build\windows-x64\native\tests\Release\LogiControl.DirectInputHarness.exe enumerate
@@ -83,6 +92,7 @@ mandatory. The harness stops and
 unloads the effect and sends `DISFFC_STOPALL` during cleanup. It never runs in
 CI.
 
-Launch a game only after the agent reports `legacy-broker-ready`. For the
-initial acceptance run, use Euro Truck Simulator 2 and preserve provider and
-broker diagnostics before beginning the Phase 2 rewrite.
+Launch a game only after `status` reports `deviceReady: true`. Phase 2 remains
+automated-test-only until the deferred matrix in `docs/hardware-matrix.md` is
+replayed. Preserve provider and broker profiling data for The Bus and Euro
+Truck Simulator 2.

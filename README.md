@@ -9,13 +9,11 @@ kernel driver.
 
 ## Status
 
-The first DFGT vertical slice works on physical hardware. A Driving Force GT
-observed as `VID_046D&PID_C294`, revision `1326`, waits for its firmware
-calibration, switches to native `PID_C29A`, and attaches to the repo-built
-legacy broker using only the Microsoft HID stack. x64 DirectInput constant,
-periodic, spring, and damper effects, The Bus, repeated unplug/replug recovery,
-and 900-degree range restoration have passed. ETS2, x86 physical playback, and
-explicit crash-lease timing remain to be recorded.
+The first DFGT vertical slice worked on physical hardware. Phase 2 now replaces
+that legacy path with the authoritative .NET broker, a 500 Hz effect engine,
+semantic IPC, and asynchronous HID output. The new path is automated-test-only
+until the next physical-wheel replay; the earlier x64 DirectInput and real-game
+results remain historical baseline evidence.
 
 This is development evidence, not a general hardware-support claim.
 See [the implementation plan](docs/implementation-plan.md) and
@@ -44,7 +42,7 @@ Managed prerequisites:
 
 ```powershell
 dotnet build .\LogiControl.slnx -c Release
-dotnet run --project .\tests\LogiControl.Protocol.Tests -c Release
+dotnet test .\LogiControl.slnx -c Release
 ```
 
 Native prerequisites:
@@ -59,11 +57,11 @@ Native prerequisites:
 
 The helper discovers the CMake bundled with Visual Studio through `vswhere`.
 
-Read-only hardware discovery:
+Broker diagnostics (do not run hardware-serving mode without the wheel):
 
 ```powershell
-dotnet run --project .\src\LogiControl.DeviceAgent -c Release -- list --json
-dotnet run --project .\src\LogiControl.DeviceAgent -c Release -- run --observe-only
+dotnet run --project .\src\LogiControl.Broker -c Release -- list --json
+dotnet run --project .\src\LogiControl.Broker -c Release -- status
 ```
 
 Development registration requires an elevated PowerShell and supports

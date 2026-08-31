@@ -2,7 +2,6 @@
   <Folder Name="/src/">
     <Project Path="src/LogiControl.Protocol/LogiControl.Protocol.csproj" />
     <Project Path="src/LogiControl.Hid/LogiControl.Hid.csproj" />
-    <Project Path="src/LogiControl.DeviceAgent/LogiControl.DeviceAgent.csproj" />
     <Project Path="src/LogiControl.Broker/LogiControl.Broker.csproj" />
     <Project Path="src/LogiControl.UI/LogiControl.UI.csproj" />
   </Folder>

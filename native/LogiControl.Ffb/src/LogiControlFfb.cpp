@@ -1,26 +1,28 @@
-// SPDX-License-Identifier: MIT
-// Adapted from DFGT Control commit 426d7007a1d40e4d2de5c5873959620f9066ec1c.
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include <windows.h>
 #include <dinput.h>
 #include <dinputd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
-#include <condition_variable>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <limits>
 #include <mutex>
 #include <new>
-#include <numbers>
 #include <string>
-#include <thread>
-#include <unordered_map>
 #include <vector>
+#include <TraceLoggingProvider.h>
 
-#include "../../LogiControl.LegacyShared/BrokerProtocol.h"
+#include "EffectMarshaller.h"
+#include "../../LogiControl.SemanticIpc/SemanticClient.h"
+
+TRACELOGGING_DEFINE_PROVIDER(
+    g_providerTelemetry,
+    "LogiControl-DirectInputProvider",
+    (0x4531ad03, 0x0288, 0x4674, 0xa8, 0xef, 0x76, 0xf4, 0x6c, 0xaf, 0x88, 0xdf));
 
 // {32FC17A4-0050-419A-BB41-59B228B5CFF4}
 static constexpr GUID CLSID_LogiControlFfb{
@@ -28,28 +30,51 @@ static constexpr GUID CLSID_LogiControlFfb{
 
 namespace {
 
+using logicontrol::ipc::EffectUpdateMask;
+using logicontrol::ipc::MessageType;
+using logicontrol::ipc::Result;
+
 std::atomic<long> g_objects{0};
 std::atomic<long> g_locks{0};
+std::atomic<long> g_profileDrivers{0};
 
-constexpr DWORD kConstantEffectId = 0;
-constexpr DWORD kRampEffectId = 1;
-constexpr DWORD kSquareEffectId = 2;
-constexpr DWORD kSineEffectId = 3;
-constexpr DWORD kTriangleEffectId = 4;
-constexpr DWORD kSawtoothUpEffectId = 5;
-constexpr DWORD kSawtoothDownEffectId = 6;
-constexpr DWORD kSpringEffectId = 7;
-constexpr DWORD kDamperEffectId = 8;
-constexpr DWORD kInertiaEffectId = 9;
-constexpr DWORD kFrictionEffectId = 10;
-constexpr DWORD kCustomForceEffectId = 0x100;
 constexpr DWORD kInvalidEffectHandle = 0;
-constexpr DWORD kFirstEffectHandle = 1;
-constexpr std::size_t kMaximumEffects = 16;
 constexpr DWORD kFirmwareRevision = 0x1322;
-constexpr DWORD kDriverVersion = 0x00010000;
-constexpr auto kMixerPeriod = std::chrono::milliseconds(8);
-constexpr DWORD kBrokerConnectTimeoutMs = 50;
+constexpr DWORD kDriverVersion = 0x00020000;
+
+bool ProfileRequested() noexcept {
+    wchar_t value[2]{};
+    return GetEnvironmentVariableW(L"LOGICONTROL_FFB_PROFILE", value, 2) == 1 && value[0] == L'1';
+}
+
+std::uint64_t QpcMicroseconds() noexcept {
+    LARGE_INTEGER counter{};
+    LARGE_INTEGER frequency{};
+    QueryPerformanceCounter(&counter);
+    QueryPerformanceFrequency(&frequency);
+    return static_cast<std::uint64_t>(counter.QuadPart * 1'000'000LL / frequency.QuadPart);
+}
+
+class CallbackTrace final {
+public:
+    explicit CallbackTrace(const char* callback) noexcept
+        : callback_(callback), enabled_(g_profileDrivers.load(std::memory_order_relaxed) > 0),
+          started_(enabled_ ? QpcMicroseconds() : 0) {}
+
+    ~CallbackTrace() {
+        if (!enabled_) return;
+        TraceLoggingWrite(
+            g_providerTelemetry,
+            "ProviderCallback",
+            TraceLoggingString(callback_, "Callback"),
+            TraceLoggingUInt64(QpcMicroseconds() - started_, "DurationMicroseconds"));
+    }
+
+private:
+    const char* callback_;
+    bool enabled_;
+    std::uint64_t started_;
+};
 
 void LogDiagnostic(const char* format, ...) noexcept {
     wchar_t enabled[2]{};
@@ -57,9 +82,7 @@ void LogDiagnostic(const char* format, ...) noexcept {
             L"LOGICONTROL_FFB_DIAGNOSTICS",
             enabled,
             static_cast<DWORD>(std::size(enabled))) == 0 ||
-        enabled[0] != L'1') {
-        return;
-    }
+        enabled[0] != L'1') return;
 
     char line[320]{};
     va_list arguments;
@@ -70,13 +93,9 @@ void LogDiagnostic(const char* format, ...) noexcept {
     strcat_s(line, "\r\n");
 
     wchar_t path[MAX_PATH]{};
-    const auto pathLength = GetTempPathW(
-        static_cast<DWORD>(std::size(path)),
-        path);
+    const auto pathLength = GetTempPathW(static_cast<DWORD>(std::size(path)), path);
     if (pathLength == 0 || pathLength >= std::size(path) ||
-        wcscat_s(path, L"logicontrol-provider-diagnostic.log") != 0) {
-        return;
-    }
+        wcscat_s(path, L"logicontrol-provider-diagnostic.log") != 0) return;
     const auto file = CreateFileW(
         path,
         FILE_APPEND_DATA,
@@ -86,259 +105,51 @@ void LogDiagnostic(const char* format, ...) noexcept {
         FILE_ATTRIBUTE_NORMAL,
         nullptr);
     if (file == INVALID_HANDLE_VALUE) return;
-    DWORD bytesWritten = 0;
-    WriteFile(
-        file,
-        line,
-        static_cast<DWORD>(strlen(line)),
-        &bytesWritten,
-        nullptr);
+    DWORD bytesWritten{};
+    WriteFile(file, line, static_cast<DWORD>(strlen(line)), &bytesWritten, nullptr);
     CloseHandle(file);
 }
 
-class BrokerTransport final {
-public:
-    BrokerTransport()
-        : heartbeat_([this](std::stop_token stop) { HeartbeatLoop(stop); }) {}
-
-    ~BrokerTransport() {
-        active_ = false;
-        heartbeat_.request_stop();
-        heartbeatWake_.notify_all();
-        StopAll();
-        Close();
+HRESULT MapResult(Result result) noexcept {
+    switch (result) {
+    case Result::Ok: return S_OK;
+    case Result::InvalidArgument: return DIERR_INVALIDPARAM;
+    case Result::Unsupported: return DIERR_UNSUPPORTED;
+    case Result::DeviceFull: return DIERR_DEVICEFULL;
+    case Result::OtherApplicationHasPriority: return DIERR_OTHERAPPHASPRIO;
+    case Result::InputLost: return DIERR_INPUTLOST;
+    case Result::NotFound: return DIERR_NOTDOWNLOADED;
+    case Result::DeviceNotReady: return DIERR_INPUTLOST;
+    case Result::ProtocolError:
+    case Result::InternalError: return E_FAIL;
     }
+    return E_FAIL;
+}
 
-    HRESULT Open(const wchar_t* path) noexcept {
-        if (path == nullptr || path[0] == L'\0') return E_INVALIDARG;
-        Close();
-        if (!WaitNamedPipeW(dfgt::ipc::PipeName, kBrokerConnectTimeoutMs)) {
-            return HRESULT_FROM_WIN32(GetLastError());
-        }
-        {
-            std::scoped_lock lock(mutex_);
-            pipe_ = CreateFileW(
-                dfgt::ipc::PipeName,
-                GENERIC_READ | GENERIC_WRITE,
-                0,
-                nullptr,
-                OPEN_EXISTING,
-                0,
-                nullptr);
-            if (pipe_ == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
-            DWORD mode = PIPE_READMODE_MESSAGE;
-            if (!SetNamedPipeHandleState(pipe_, &mode, nullptr, nullptr)) {
-                const auto result = HRESULT_FROM_WIN32(GetLastError());
-                CloseHandle(pipe_);
-                pipe_ = INVALID_HANDLE_VALUE;
-                return result;
-            }
-        }
+void Write32(std::span<std::byte> destination, std::size_t offset, std::uint32_t value) noexcept {
+    logicontrol::ipc::detail::Write32(destination, offset, value);
+}
 
-        dfgt::ipc::Message message{};
-        message.command = dfgt::ipc::Command::Open;
-        if (wcsncpy_s(
-                message.devicePath,
-                dfgt::ipc::DevicePathCharacters,
-                path,
-                _TRUNCATE) != 0) {
-            Close();
-            return E_INVALIDARG;
-        }
-        return Send(message);
-    }
-
-    bool IsOpen() noexcept {
-        std::scoped_lock lock(mutex_);
-        return pipe_ != INVALID_HANDLE_VALUE;
-    }
-
-    void Close() noexcept {
-        active_ = false;
-        std::scoped_lock lock(mutex_);
-        if (pipe_ == INVALID_HANDLE_VALUE) return;
-        dfgt::ipc::Message message{};
-        message.command = dfgt::ipc::Command::Close;
-        SendLocked(message);
-        CloseHandle(pipe_);
-        pipe_ = INVALID_HANDLE_VALUE;
-    }
-
-    HRESULT Constant(
-        std::int32_t magnitude,
-        std::int32_t periodicMagnitude = 0) noexcept {
-        dfgt::ipc::Message message{};
-        message.command = dfgt::ipc::Command::Constant;
-        message.value = std::clamp(magnitude, -10000, 10000);
-        message.auxiliary =
-            std::clamp(periodicMagnitude, -10000, 10000);
-        const auto result = Send(message);
-        active_ = SUCCEEDED(result) &&
-            (magnitude != 0 || periodicMagnitude != 0);
-        heartbeatWake_.notify_all();
-        return result;
-    }
-
-    HRESULT StopSlotOne() noexcept { return StopAll(); }
-
-    HRESULT StopAll() noexcept {
-        active_ = false;
-        dfgt::ipc::Message message{};
-        message.command = dfgt::ipc::Command::StopAll;
-        return Send(message);
-    }
-
-    HRESULT Condition(
-        dfgt::ipc::Command command,
-        LONG negativeCoefficient,
-        LONG positiveCoefficient,
-        LONG center,
-        DWORD deadBand,
-        DWORD negativeSaturation,
-        DWORD positiveSaturation) noexcept {
-        if (command != dfgt::ipc::Command::Spring &&
-            command != dfgt::ipc::Command::Damper &&
-            command != dfgt::ipc::Command::Friction) {
-            return E_INVALIDARG;
-        }
-        dfgt::ipc::Message message{};
-        message.command = command;
-        message.value = std::clamp<LONG>(negativeCoefficient, -10000, 10000);
-        message.auxiliary = std::clamp<LONG>(positiveCoefficient, -10000, 10000);
-        message.value3 = std::clamp<LONG>(center, -10000, 10000);
-        message.value4 = static_cast<std::int32_t>(std::min<DWORD>(deadBand, 10000));
-        message.value5 = static_cast<std::int32_t>(
-            std::min<DWORD>(negativeSaturation, 10000));
-        message.value6 = static_cast<std::int32_t>(
-            std::min<DWORD>(positiveSaturation, 10000));
-        const auto result = Send(message);
-        active_ = SUCCEEDED(result);
-        heartbeatWake_.notify_all();
-        return result;
-    }
-
-private:
-    HRESULT Send(dfgt::ipc::Message& message) noexcept {
-        std::scoped_lock lock(mutex_);
-        return SendLocked(message);
-    }
-
-    HRESULT SendLocked(dfgt::ipc::Message& message) noexcept {
-        if (pipe_ == INVALID_HANDLE_VALUE) return DIERR_NOTINITIALIZED;
-        message.sequence = ++sequence_;
-        DWORD written = 0;
-        if (!WriteFile(pipe_, &message, sizeof(message), &written, nullptr) ||
-            written != sizeof(message)) {
-            return HRESULT_FROM_WIN32(GetLastError());
-        }
-
-        dfgt::ipc::Response response{};
-        DWORD read = 0;
-        if (!ReadFile(pipe_, &response, sizeof(response), &read, nullptr) ||
-            read != sizeof(response)) {
-            return HRESULT_FROM_WIN32(GetLastError());
-        }
-        if (response.magic != dfgt::ipc::Magic ||
-            response.version != dfgt::ipc::Version ||
-            response.size != sizeof(response) ||
-            response.sequence != message.sequence) {
-            return E_FAIL;
-        }
-        return response.result;
-    }
-
-    void HeartbeatLoop(std::stop_token stop) noexcept {
-        std::mutex waitMutex;
-        std::unique_lock waitLock(waitMutex);
-        while (!stop.stop_requested()) {
-            heartbeatWake_.wait_for(waitLock, std::chrono::milliseconds(100));
-            if (stop.stop_requested() || !active_) continue;
-            dfgt::ipc::Message message{};
-            message.command = dfgt::ipc::Command::Heartbeat;
-            if (FAILED(Send(message))) active_ = false;
-        }
-    }
-
-    HANDLE pipe_{INVALID_HANDLE_VALUE};
-    std::mutex mutex_;
-    std::atomic<bool> active_{false};
-    std::uint32_t sequence_{};
-    std::condition_variable heartbeatWake_;
-    std::jthread heartbeat_;
-};
-
-enum class EffectKind {
-    Constant,
-    Ramp,
-    Square,
-    Sine,
-    Triangle,
-    SawtoothUp,
-    SawtoothDown,
-    Spring,
-    Damper,
-    Friction,
-    Inertia,
-    Custom,
-};
-
-struct EffectState {
-    EffectKind kind{EffectKind::Constant};
-    LONG magnitude{};
-    LONG offset{};
-    LONG startMagnitude{};
-    LONG endMagnitude{};
-    DWORD phase{};
-    DWORD periodUs{100000};
-    DWORD gain{10000};
-    DWORD durationUs{INFINITE};
-    DWORD startDelayUs{};
-    DIENVELOPE envelope{};
-    bool hasEnvelope{};
-    LONG direction{1};
-    DICONDITION condition{};
-    std::vector<LONG> customSamples;
-    DWORD customSamplePeriodUs{};
-    std::chrono::steady_clock::time_point startsAt{};
-    std::chrono::steady_clock::time_point deadline{};
-    bool hasDeadline{};
-    bool conditionStarted{};
-    bool playing{};
-};
-
-struct ConditionRender {
-    dfgt::ipc::Command command{};
-    LONG negativeCoefficient{};
-    LONG positiveCoefficient{};
-    LONG center{};
-    DWORD deadBand{};
-    DWORD negativeSaturation{};
-    DWORD positiveSaturation{};
-};
-
-struct RenderPlan {
-    bool requiresTransport{};
-    std::wstring devicePath;
-    bool stopAll{};
-    bool sendConstant{};
-    std::int32_t constant{};
-    std::int32_t periodic{};
-    std::vector<ConditionRender> conditions;
-};
+std::uint32_t Read32(std::span<const std::byte> source, std::size_t offset = 0) noexcept {
+    return logicontrol::ipc::detail::Read32(source, offset);
+}
 
 class EffectDriver final : public IDirectInputEffectDriver {
 public:
-    EffectDriver()
-        : timer_([this](std::stop_token stop) { TimerLoop(stop); }) {
+    EffectDriver() {
+        profileEnabled_ = ProfileRequested();
+        if (profileEnabled_ && g_profileDrivers.fetch_add(1) == 0) {
+            TraceLoggingRegister(g_providerTelemetry);
+        }
         ++g_objects;
     }
+
     ~EffectDriver() {
-        timer_.request_stop();
-        timerWake_.notify_all();
-        if (timer_.joinable()) timer_.join();
-        transport_.StopAll();
-        transport_.Close();
+        client_.Close();
         --g_objects;
+        if (profileEnabled_ && g_profileDrivers.fetch_sub(1) == 1) {
+            TraceLoggingUnregister(g_providerTelemetry);
+        }
     }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
@@ -352,9 +163,7 @@ public:
         return E_NOINTERFACE;
     }
 
-    ULONG STDMETHODCALLTYPE AddRef() override {
-        return static_cast<ULONG>(++references_);
-    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(++references_); }
 
     ULONG STDMETHODCALLTYPE Release() override {
         const auto remaining = --references_;
@@ -368,36 +177,28 @@ public:
         DWORD begin,
         DWORD,
         void* initInfo) override {
-        LogDiagnostic(
-            "DeviceID begin=%lu externalId=%lu",
-            static_cast<unsigned long>(begin),
-            static_cast<unsigned long>(externalId));
-        std::scoped_lock lock(stateMutex_);
+        CallbackTrace trace("DeviceID");
+        LogDiagnostic("DeviceID begin=%lu externalId=%lu", begin, externalId);
         if (begin == 0) {
-            transport_.StopAll();
-            lastRendered_ = 0;
-            transport_.Close();
-            effects_.clear();
+            client_.Close();
+            std::scoped_lock lock(identityMutex_);
             devicePath_.clear();
             externalId_ = 0;
             return S_OK;
         }
         if (initInfo == nullptr) return E_INVALIDARG;
         const auto* info = static_cast<const DIHIDFFINITINFO*>(initInfo);
-        if (info->dwSize < sizeof(DIHIDFFINITINFO) || info->pwszDeviceInterface == nullptr) {
-            return E_INVALIDARG;
-        }
+        if (info->dwSize < sizeof(DIHIDFFINITINFO) || info->pwszDeviceInterface == nullptr ||
+            info->pwszDeviceInterface[0] == L'\0') return E_INVALIDARG;
+        std::scoped_lock lock(identityMutex_);
         devicePath_ = info->pwszDeviceInterface;
         externalId_ = externalId;
-        actuatorsEnabled_ = true;
-        paused_ = false;
         return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE GetVersions(DIDRIVERVERSIONS* versions) override {
-        if (versions == nullptr || versions->dwSize < sizeof(DIDRIVERVERSIONS)) {
-            return E_INVALIDARG;
-        }
+        CallbackTrace trace("GetVersions");
+        if (versions == nullptr || versions->dwSize < sizeof(DIDRIVERVERSIONS)) return E_INVALIDARG;
         versions->dwFirmwareRevision = kFirmwareRevision;
         versions->dwHardwareRevision = kFirmwareRevision;
         versions->dwFFDriverVersion = kDriverVersion;
@@ -405,84 +206,59 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE Escape(DWORD, DWORD, DIEFFESCAPE*) override {
+        CallbackTrace trace("Escape");
         return DIERR_UNSUPPORTED;
     }
 
     HRESULT STDMETHODCALLTYPE SetGain(DWORD externalId, DWORD gain) override {
-        LogDiagnostic(
-            "SetGain externalId=%lu gain=%lu",
-            static_cast<unsigned long>(externalId),
-            static_cast<unsigned long>(gain));
+        CallbackTrace trace("SetGain");
         if (!Matches(externalId) || gain > 10000) return E_INVALIDARG;
-        std::scoped_lock lock(stateMutex_);
-        globalGain_ = gain;
-        renderEverythingPending_ = true;
-        return S_OK;
+        const auto connected = EnsureConnected();
+        if (FAILED(connected)) return connected;
+        std::array<std::byte, 4> payload{};
+        Write32(payload, 0, gain);
+        return MapResult(client_.Send(MessageType::SetGain, payload).result);
     }
 
     HRESULT STDMETHODCALLTYPE SendForceFeedbackCommand(DWORD externalId, DWORD command) override {
-        LogDiagnostic(
-            "SendForceFeedbackCommand externalId=%lu command=%lu",
-            static_cast<unsigned long>(externalId),
-            static_cast<unsigned long>(command));
+        CallbackTrace trace("SendForceFeedbackCommand");
         if (!Matches(externalId)) return E_INVALIDARG;
-        std::scoped_lock lock(stateMutex_);
+        std::uint8_t semantic{};
         switch (command) {
-        case DISFFC_RESET:
-            effects_.clear();
-            paused_ = false;
-            lastRendered_ = 0;
-            lastPeriodicRendered_ = 0;
-            renderEverythingPending_ = true;
-            return S_OK;
-        case DISFFC_STOPALL:
-            for (auto& [_, effect] : effects_) {
-                effect.playing = false;
-                effect.conditionStarted = false;
-            }
-            paused_ = false;
-            lastRendered_ = 0;
-            lastPeriodicRendered_ = 0;
-            renderEverythingPending_ = true;
-            return S_OK;
-        case DISFFC_PAUSE:
-            paused_ = true;
-            lastRendered_ = 0;
-            lastPeriodicRendered_ = 0;
-            renderEverythingPending_ = true;
-            return S_OK;
-        case DISFFC_CONTINUE:
-            paused_ = false;
-            renderEverythingPending_ = true;
-            return S_OK;
-        case DISFFC_SETACTUATORSON:
-            actuatorsEnabled_ = true;
-            renderEverythingPending_ = true;
-            return S_OK;
-        case DISFFC_SETACTUATORSOFF:
-            actuatorsEnabled_ = false;
-            lastRendered_ = 0;
-            lastPeriodicRendered_ = 0;
-            renderEverythingPending_ = true;
-            return S_OK;
-        default:
-            return E_INVALIDARG;
+        case DISFFC_PAUSE: semantic = 0; break;
+        case DISFFC_CONTINUE: semantic = 1; break;
+        case DISFFC_SETACTUATORSON: semantic = 2; break;
+        case DISFFC_SETACTUATORSOFF: semantic = 3; break;
+        case DISFFC_STOPALL: semantic = 4; break;
+        case DISFFC_RESET: semantic = 5; break;
+        default: return E_INVALIDARG;
         }
+        const auto connected = EnsureConnected();
+        if (FAILED(connected)) return connected;
+        std::array<std::byte, 4> payload{};
+        payload[0] = static_cast<std::byte>(semantic);
+        return MapResult(client_.Send(MessageType::DeviceCommand, payload).result);
     }
 
     HRESULT STDMETHODCALLTYPE GetForceFeedbackState(
         DWORD externalId,
         DIDEVICESTATE* state) override {
+        CallbackTrace trace("GetForceFeedbackState");
         if (!Matches(externalId) || state == nullptr || state->dwSize < sizeof(DIDEVICESTATE)) {
             return E_INVALIDARG;
         }
-        std::scoped_lock lock(stateMutex_);
-        state->dwState = 0;
-        if (paused_) state->dwState |= DIGFFS_PAUSED;
-        if (actuatorsEnabled_) state->dwState |= DIGFFS_ACTUATORSON;
-        else state->dwState |= DIGFFS_ACTUATORSOFF;
-        state->dwState |= DIGFFS_POWERON | DIGFFS_SAFETYSWITCHOFF | DIGFFS_USERFFSWITCHON;
-        state->dwLoad = std::min<DWORD>(100, static_cast<DWORD>(effects_.size()) * 6);
+        const auto connected = EnsureConnected();
+        if (FAILED(connected)) return connected;
+        const auto response = client_.Send(MessageType::QueryDeviceState);
+        const auto mapped = MapResult(response.result);
+        if (FAILED(mapped)) return mapped;
+        if (response.payload.size() != 24) return E_FAIL;
+        const auto flags = Read32(response.payload, 16);
+        const auto downloads = Read32(response.payload, 20);
+        state->dwState = DIGFFS_POWERON | DIGFFS_SAFETYSWITCHOFF | DIGFFS_USERFFSWITCHON;
+        state->dwState |= (flags & 1U) != 0 ? DIGFFS_PAUSED : 0;
+        state->dwState |= (flags & 2U) != 0 ? DIGFFS_ACTUATORSON : DIGFFS_ACTUATORSOFF;
+        state->dwLoad = std::min<DWORD>(100, downloads * 100 / 16);
         return S_OK;
     }
 
@@ -492,66 +268,50 @@ public:
         DWORD* handle,
         const DIEFFECT* effect,
         DWORD flags) override {
+        CallbackTrace trace("DownloadEffect");
         if (!Matches(externalId) || handle == nullptr || effect == nullptr) return E_INVALIDARG;
-        LogDiagnostic(
-            "DownloadEffect externalId=%lu effectId=%lu flags=%lu handle=%lu",
-            static_cast<unsigned long>(externalId),
-            static_cast<unsigned long>(effectId),
-            static_cast<unsigned long>(flags),
-            static_cast<unsigned long>(*handle));
-        EffectState candidate{};
-        const auto parseResult = ParseEffect(effectId, *effect, candidate);
-        LogDiagnostic(
-            "DownloadEffect parse=0x%08lX magnitude=%ld gain=%lu duration=%lu",
-            static_cast<unsigned long>(parseResult),
-            static_cast<long>(candidate.magnitude),
-            static_cast<unsigned long>(candidate.gain),
-            static_cast<unsigned long>(candidate.durationUs));
-        if (FAILED(parseResult)) return parseResult;
-        if ((flags & DIEP_NODOWNLOAD) != 0) return S_OK;
+        constexpr DWORD controlFlags = DIEP_START | DIEP_NORESTART | DIEP_NODOWNLOAD;
+        if ((flags & ~(DIEP_ALLPARAMS | controlFlags)) != 0) return DIERR_INVALIDPARAM;
 
-        std::scoped_lock lock(stateMutex_);
-        if (*handle == kInvalidEffectHandle) {
-            if (effects_.size() >= kMaximumEffects) return DIERR_DEVICEFULL;
-            while (nextHandle_ == kInvalidEffectHandle ||
-                   effects_.contains(nextHandle_)) {
-                ++nextHandle_;
-            }
-            *handle = nextHandle_++;
-            effects_.emplace(*handle, EffectState{});
-        } else if (!effects_.contains(*handle)) {
-            return DIERR_NOTDOWNLOADED;
+        logicontrol::ipc::EffectDefinition definition{};
+        EffectUpdateMask updateMask{};
+        const auto marshal = logicontrol::provider::MarshalEffect(effectId, *effect, flags, definition, updateMask);
+        if (FAILED(marshal)) return marshal;
+        const auto connected = EnsureConnected();
+        if (FAILED(connected)) return connected;
+
+        const auto effectLength = logicontrol::ipc::EncodedEffectLength(definition);
+        std::vector<std::byte> payload(8U + effectLength);
+        Write32(payload, 0, *handle);
+        logicontrol::ipc::detail::Write16(payload, 4, static_cast<std::uint16_t>(updateMask));
+        if (!logicontrol::ipc::EncodeEffect(std::span<std::byte>(payload).subspan(8), definition)) {
+            return DIERR_INVALIDPARAM;
         }
-        auto& stored = effects_.at(*handle);
-        candidate.playing = stored.playing;
-        candidate.hasDeadline = stored.hasDeadline;
-        candidate.startsAt = stored.startsAt;
-        candidate.deadline = stored.deadline;
-        candidate.conditionStarted = stored.conditionStarted;
-        stored = candidate;
+        const auto message = (flags & DIEP_NODOWNLOAD) != 0
+            ? MessageType::ValidateEffect
+            : MessageType::UpsertEffect;
+        const auto response = client_.Send(message, payload);
+        const auto mapped = MapResult(response.result);
+        if (FAILED(mapped)) return mapped;
+        if ((flags & DIEP_NODOWNLOAD) != 0) return S_OK;
+        if (response.payload.size() != 4) return E_FAIL;
+        *handle = Read32(response.payload);
+        if (*handle == kInvalidEffectHandle) return E_FAIL;
+
         if ((flags & DIEP_START) != 0) {
-            stored.playing = true;
-            ArmDeadline(stored, 1);
-        }
-        if (stored.playing) {
-            if (IsCondition(stored.kind)) {
-                stored.conditionStarted = false;
-                renderEverythingPending_ = true;
-            }
+            return StartSemantic(
+                *handle,
+                1,
+                false,
+                (flags & DIEP_NORESTART) == 0);
         }
         return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE DestroyEffect(DWORD externalId, DWORD handle) override {
+        CallbackTrace trace("DestroyEffect");
         if (!Matches(externalId) || handle == kInvalidEffectHandle) return E_INVALIDARG;
-        std::scoped_lock lock(stateMutex_);
-        const auto found = effects_.find(handle);
-        if (found == effects_.end()) return DIERR_NOTDOWNLOADED;
-        const bool wasPlaying = found->second.playing;
-        const bool wasCondition = IsCondition(found->second.kind);
-        effects_.erase(found);
-        if (wasPlaying && wasCondition) renderEverythingPending_ = true;
-        return S_OK;
+        return SendHandle(MessageType::DestroyEffect, handle);
     }
 
     HRESULT STDMETHODCALLTYPE StartEffect(
@@ -559,529 +319,77 @@ public:
         DWORD handle,
         DWORD mode,
         DWORD iterations) override {
-        LogDiagnostic(
-            "StartEffect externalId=%lu handle=%lu mode=%lu iterations=%lu",
-            static_cast<unsigned long>(externalId),
-            static_cast<unsigned long>(handle),
-            static_cast<unsigned long>(mode),
-            static_cast<unsigned long>(iterations));
-        if (!Matches(externalId)) return E_INVALIDARG;
-        std::scoped_lock lock(stateMutex_);
-        const auto found = effects_.find(handle);
-        if (found == effects_.end()) return DIERR_NOTDOWNLOADED;
-        if (iterations == 0) return E_INVALIDARG;
-        found->second.playing = true;
-        ArmDeadline(found->second, iterations);
-        if (IsCondition(found->second.kind)) renderEverythingPending_ = true;
-        return S_OK;
+        CallbackTrace trace("StartEffect");
+        if (!Matches(externalId) || handle == kInvalidEffectHandle || iterations == 0 ||
+            (mode & ~(DIES_SOLO | DIES_NODOWNLOAD)) != 0) return E_INVALIDARG;
+        return StartSemantic(handle, iterations, (mode & DIES_SOLO) != 0, true);
     }
 
     HRESULT STDMETHODCALLTYPE StopEffect(DWORD externalId, DWORD handle) override {
-        LogDiagnostic(
-            "StopEffect externalId=%lu handle=%lu",
-            static_cast<unsigned long>(externalId),
-            static_cast<unsigned long>(handle));
-        if (!Matches(externalId)) return E_INVALIDARG;
-        std::scoped_lock lock(stateMutex_);
-        const auto found = effects_.find(handle);
-        if (found == effects_.end()) return DIERR_NOTDOWNLOADED;
-        found->second.playing = false;
-        found->second.hasDeadline = false;
-        found->second.conditionStarted = false;
-        if (IsCondition(found->second.kind)) renderEverythingPending_ = true;
-        return S_OK;
+        CallbackTrace trace("StopEffect");
+        if (!Matches(externalId) || handle == kInvalidEffectHandle) return E_INVALIDARG;
+        return SendHandle(MessageType::StopEffect, handle);
     }
 
     HRESULT STDMETHODCALLTYPE GetEffectStatus(
         DWORD externalId,
         DWORD handle,
         DWORD* status) override {
-        if (!Matches(externalId) || status == nullptr) return E_INVALIDARG;
-        std::scoped_lock lock(stateMutex_);
-        const auto found = effects_.find(handle);
-        if (found == effects_.end()) return DIERR_NOTDOWNLOADED;
-        *status = found->second.playing && !paused_ && actuatorsEnabled_
-            ? DIEGES_PLAYING
-            : 0;
+        CallbackTrace trace("GetEffectStatus");
+        if (!Matches(externalId) || handle == kInvalidEffectHandle || status == nullptr) return E_INVALIDARG;
+        const auto connected = EnsureConnected();
+        if (FAILED(connected)) return connected;
+        std::array<std::byte, 4> payload{};
+        Write32(payload, 0, handle);
+        const auto response = client_.Send(MessageType::QueryEffect, payload);
+        const auto mapped = MapResult(response.result);
+        if (FAILED(mapped)) return mapped;
+        if (response.payload.size() < 4) return E_FAIL;
+        const auto playback = std::to_integer<std::uint8_t>(response.payload[0]);
+        *status = playback == 1 || playback == 2 || playback == 3 ? DIEGES_PLAYING : 0;
         return S_OK;
     }
 
 private:
-    static bool IsCondition(EffectKind kind) noexcept {
-        return kind == EffectKind::Spring ||
-            kind == EffectKind::Damper ||
-            kind == EffectKind::Inertia ||
-            kind == EffectKind::Friction;
+    bool Matches(DWORD externalId) const noexcept { return externalId_.load() == externalId && externalId != 0; }
+
+    HRESULT EnsureConnected() noexcept {
+        if (client_.IsConnected()) return S_OK;
+        std::wstring path;
+        {
+            std::scoped_lock lock(identityMutex_);
+            path = devicePath_;
+        }
+        if (path.empty()) return DIERR_NOTINITIALIZED;
+        const auto result = client_.ConnectAndBind(path.c_str());
+        LogDiagnostic("Semantic connect result=%ld", static_cast<long>(result));
+        return MapResult(result);
     }
 
-    static HRESULT ParseEffect(
-        DWORD effectId,
-        const DIEFFECT& source,
-        EffectState& target) noexcept {
-        if (source.dwSize < sizeof(DIEFFECT) ||
-            source.dwGain > 10000 ||
-            source.lpvTypeSpecificParams == nullptr ||
-            source.cAxes != 1 ||
-            source.rgdwAxes == nullptr ||
-            source.rglDirection == nullptr ||
-            (source.dwFlags & DIEFF_CARTESIAN) == 0) {
-            return DIERR_INVALIDPARAM;
-        }
-
-        target.gain = source.dwGain;
-        target.durationUs = source.dwDuration;
-        target.startDelayUs = source.dwStartDelay;
-        target.direction = source.rglDirection[0] < 0 ? -1 : 1;
-        if (source.lpEnvelope != nullptr) {
-            if (source.lpEnvelope->dwSize < sizeof(DIENVELOPE) ||
-                source.lpEnvelope->dwAttackLevel > 10000 ||
-                source.lpEnvelope->dwFadeLevel > 10000) {
-                return DIERR_INVALIDPARAM;
-            }
-            target.envelope = *source.lpEnvelope;
-            target.hasEnvelope = true;
-        }
-
-        switch (effectId) {
-        case kConstantEffectId: {
-            if (source.cbTypeSpecificParams != sizeof(DICONSTANTFORCE)) {
-                return DIERR_INVALIDPARAM;
-            }
-            const auto& parameters =
-                *static_cast<const DICONSTANTFORCE*>(source.lpvTypeSpecificParams);
-            if (parameters.lMagnitude < -10000 || parameters.lMagnitude > 10000) {
-                return DIERR_INVALIDPARAM;
-            }
-            target.kind = EffectKind::Constant;
-            target.magnitude = parameters.lMagnitude;
-            return S_OK;
-        }
-        case kRampEffectId: {
-            if (source.cbTypeSpecificParams != sizeof(DIRAMPFORCE)) {
-                return DIERR_INVALIDPARAM;
-            }
-            const auto& parameters =
-                *static_cast<const DIRAMPFORCE*>(source.lpvTypeSpecificParams);
-            if (parameters.lStart < -10000 || parameters.lStart > 10000 ||
-                parameters.lEnd < -10000 || parameters.lEnd > 10000) {
-                return DIERR_INVALIDPARAM;
-            }
-            target.kind = EffectKind::Ramp;
-            target.startMagnitude = parameters.lStart;
-            target.endMagnitude = parameters.lEnd;
-            return S_OK;
-        }
-        case kSquareEffectId:
-        case kSineEffectId:
-        case kTriangleEffectId:
-        case kSawtoothUpEffectId:
-        case kSawtoothDownEffectId: {
-            if (source.cbTypeSpecificParams != sizeof(DIPERIODIC)) {
-                return DIERR_INVALIDPARAM;
-            }
-            const auto& parameters =
-                *static_cast<const DIPERIODIC*>(source.lpvTypeSpecificParams);
-            if (parameters.dwMagnitude > 10000 ||
-                parameters.lOffset < -10000 ||
-                parameters.lOffset > 10000 ||
-                parameters.dwPhase >= 36000 ||
-                parameters.dwPeriod == 0) {
-                return DIERR_INVALIDPARAM;
-            }
-            target.kind = effectId == kSquareEffectId ? EffectKind::Square
-                : effectId == kSineEffectId ? EffectKind::Sine
-                : effectId == kTriangleEffectId ? EffectKind::Triangle
-                : effectId == kSawtoothUpEffectId ? EffectKind::SawtoothUp
-                : EffectKind::SawtoothDown;
-            target.magnitude = static_cast<LONG>(parameters.dwMagnitude);
-            target.offset = parameters.lOffset;
-            target.phase = parameters.dwPhase;
-            target.periodUs = parameters.dwPeriod;
-            return S_OK;
-        }
-        case kSpringEffectId:
-        case kDamperEffectId:
-        case kInertiaEffectId:
-        case kFrictionEffectId: {
-            if (source.cbTypeSpecificParams != sizeof(DICONDITION)) {
-                return DIERR_INVALIDPARAM;
-            }
-            const auto& parameters =
-                *static_cast<const DICONDITION*>(source.lpvTypeSpecificParams);
-            if (parameters.lOffset < -10000 || parameters.lOffset > 10000 ||
-                parameters.lPositiveCoefficient < -10000 ||
-                parameters.lPositiveCoefficient > 10000 ||
-                parameters.lNegativeCoefficient < -10000 ||
-                parameters.lNegativeCoefficient > 10000 ||
-                parameters.dwPositiveSaturation > 10000 ||
-                parameters.dwNegativeSaturation > 10000 ||
-                parameters.lDeadBand < 0 ||
-                parameters.lDeadBand > 10000) {
-                return DIERR_INVALIDPARAM;
-            }
-            target.kind = effectId == kSpringEffectId ? EffectKind::Spring
-                : effectId == kDamperEffectId ? EffectKind::Damper
-                : effectId == kInertiaEffectId ? EffectKind::Inertia
-                : EffectKind::Friction;
-            target.condition = parameters;
-            return S_OK;
-        }
-        case kCustomForceEffectId: {
-            if (source.cbTypeSpecificParams != sizeof(DICUSTOMFORCE)) {
-                return DIERR_INVALIDPARAM;
-            }
-            const auto& parameters =
-                *static_cast<const DICUSTOMFORCE*>(source.lpvTypeSpecificParams);
-            constexpr DWORD kMaximumCustomSamples = 4096;
-            if (parameters.cChannels != 1 ||
-                parameters.dwSamplePeriod == 0 ||
-                (source.dwSamplePeriod != 0 &&
-                 source.dwSamplePeriod != parameters.dwSamplePeriod) ||
-                parameters.cSamples == 0 ||
-                parameters.cSamples > kMaximumCustomSamples ||
-                parameters.rglForceData == nullptr) {
-                return DIERR_INVALIDPARAM;
-            }
-            target.customSamples.assign(
-                parameters.rglForceData,
-                parameters.rglForceData + parameters.cSamples);
-            if (std::ranges::any_of(
-                    target.customSamples,
-                    [](LONG sample) { return sample < -10000 || sample > 10000; })) {
-                return DIERR_INVALIDPARAM;
-            }
-            target.kind = EffectKind::Custom;
-            target.customSamplePeriodUs = parameters.dwSamplePeriod;
-            return S_OK;
-        }
-        default:
-            return DIERR_UNSUPPORTED;
-        }
+    HRESULT SendHandle(MessageType message, DWORD handle) noexcept {
+        const auto connected = EnsureConnected();
+        if (FAILED(connected)) return connected;
+        std::array<std::byte, 4> payload{};
+        Write32(payload, 0, handle);
+        return MapResult(client_.Send(message, payload).result);
     }
 
-    bool Matches(DWORD externalId) const noexcept {
-        return externalId_ == externalId;
-    }
-
-    static std::int32_t EvaluateEffect(
-        const EffectState& effect,
-        std::chrono::steady_clock::time_point now) noexcept {
-        if (now < effect.startsAt) return 0;
-        const auto elapsedUs = static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                now - effect.startsAt).count());
-        const auto localUs = effect.durationUs != INFINITE && effect.durationUs != 0
-            ? elapsedUs % effect.durationUs
-            : elapsedUs;
-
-        double value = 0;
-        switch (effect.kind) {
-        case EffectKind::Constant:
-            value = effect.magnitude;
-            break;
-        case EffectKind::Ramp: {
-            const auto denominator = effect.durationUs == 0 || effect.durationUs == INFINITE
-                ? 1.0
-                : static_cast<double>(effect.durationUs);
-            const auto progress = std::clamp(localUs / denominator, 0.0, 1.0);
-            value = effect.startMagnitude +
-                (effect.endMagnitude - effect.startMagnitude) * progress;
-            break;
-        }
-        case EffectKind::Square:
-        case EffectKind::Sine:
-        case EffectKind::Triangle:
-        case EffectKind::SawtoothUp:
-        case EffectKind::SawtoothDown: {
-            const auto cycle = std::fmod(
-                static_cast<double>(elapsedUs) / effect.periodUs +
-                    static_cast<double>(effect.phase) / 36000.0,
-                1.0);
-            double wave = 0;
-            if (effect.kind == EffectKind::Square) wave = cycle < 0.5 ? 1.0 : -1.0;
-            else if (effect.kind == EffectKind::Sine) {
-                wave = std::sin(cycle * 2.0 * std::numbers::pi);
-            } else if (effect.kind == EffectKind::Triangle) {
-                wave = 1.0 - 4.0 * std::abs(cycle - 0.5);
-            } else if (effect.kind == EffectKind::SawtoothUp) {
-                wave = 2.0 * cycle - 1.0;
-            } else {
-                wave = 1.0 - 2.0 * cycle;
-            }
-            value = effect.offset + effect.magnitude * wave;
-            break;
-        }
-        case EffectKind::Spring:
-        case EffectKind::Damper:
-        case EffectKind::Friction:
-        case EffectKind::Inertia:
-            return 0;
-        case EffectKind::Custom: {
-            if (effect.customSamples.empty() || effect.customSamplePeriodUs == 0) {
-                return 0;
-            }
-            const auto index =
-                (elapsedUs / effect.customSamplePeriodUs) %
-                effect.customSamples.size();
-            value = effect.customSamples[static_cast<std::size_t>(index)];
-            break;
-        }
-        }
-
-        if (effect.hasEnvelope) {
-            double envelopeGain = 1.0;
-            if (effect.envelope.dwAttackTime > 0 &&
-                localUs < effect.envelope.dwAttackTime) {
-                const auto progress =
-                    static_cast<double>(localUs) / effect.envelope.dwAttackTime;
-                envelopeGain =
-                    effect.envelope.dwAttackLevel / 10000.0 +
-                    (1.0 - effect.envelope.dwAttackLevel / 10000.0) * progress;
-            } else if (effect.durationUs != INFINITE &&
-                       effect.envelope.dwFadeTime > 0 &&
-                       localUs + effect.envelope.dwFadeTime >= effect.durationUs) {
-                const auto remaining = effect.durationUs > localUs
-                    ? effect.durationUs - localUs
-                    : 0;
-                const auto progress =
-                    static_cast<double>(remaining) / effect.envelope.dwFadeTime;
-                envelopeGain =
-                    effect.envelope.dwFadeLevel / 10000.0 +
-                    (1.0 - effect.envelope.dwFadeLevel / 10000.0) * progress;
-            }
-            value *= std::clamp(envelopeGain, 0.0, 1.0);
-        }
-
-        value *= effect.direction;
-        value *= effect.gain / 10000.0;
-        return std::clamp(
-            static_cast<std::int32_t>(std::lround(value)),
-            -10000,
-            10000);
-    }
-
-    void AddSoftwareRenderLocked(
-        std::chrono::steady_clock::time_point now,
-        RenderPlan& plan) noexcept {
-        if (paused_ || !actuatorsEnabled_) return;
-        std::int64_t sum = 0;
-        std::int64_t periodicSum = 0;
-        for (auto& [_, effect] : effects_) {
-            if (!effect.playing) continue;
-            const auto value = EvaluateEffect(effect, now);
-            if (effect.kind == EffectKind::Square ||
-                effect.kind == EffectKind::Sine ||
-                effect.kind == EffectKind::Triangle ||
-                effect.kind == EffectKind::SawtoothUp ||
-                effect.kind == EffectKind::SawtoothDown) {
-                periodicSum += value;
-            } else {
-                sum += value;
-            }
-        }
-        const auto scaled = std::clamp<std::int64_t>(
-            sum * globalGain_ / 10000,
-            -10000,
-            10000);
-        const auto periodicScaled = std::clamp<std::int64_t>(
-            periodicSum * globalGain_ / 10000,
-            -10000,
-            10000);
-        const auto rendered = static_cast<std::int32_t>(scaled);
-        const auto periodicRendered =
-            static_cast<std::int32_t>(periodicScaled);
-        if (rendered == lastRendered_ &&
-            periodicRendered == lastPeriodicRendered_) return;
-        plan.sendConstant = true;
-        plan.constant = rendered;
-        plan.periodic = periodicRendered;
-        lastRendered_ = rendered;
-        lastPeriodicRendered_ = periodicRendered;
-    }
-
-    void AddConditionRendersLocked(
-        std::chrono::steady_clock::time_point now,
-        RenderPlan& plan) {
-        if (paused_ || !actuatorsEnabled_) return;
-        for (auto& [_, effect] : effects_) {
-            if (!effect.playing || now < effect.startsAt) continue;
-            dfgt::ipc::Command command{};
-            if (effect.kind == EffectKind::Spring) command = dfgt::ipc::Command::Spring;
-            else if (effect.kind == EffectKind::Damper) command = dfgt::ipc::Command::Damper;
-            else if (effect.kind == EffectKind::Inertia) {
-                // The original Windows Logitech provider and new-lg4ff map
-                // unsupported native inertia to the wheel's damper slot.
-                command = dfgt::ipc::Command::Damper;
-            }
-            else if (effect.kind == EffectKind::Friction) {
-                command = dfgt::ipc::Command::Friction;
-            } else {
-                continue;
-            }
-
-            const auto scaleSigned = [&](LONG value) {
-                return static_cast<LONG>(std::clamp<std::int64_t>(
-                    static_cast<std::int64_t>(value) *
-                        effect.gain * globalGain_ /
-                        10000 / 10000,
-                    -10000,
-                    10000));
-            };
-            const auto scaleUnsigned = [&](DWORD value) {
-                return static_cast<DWORD>(std::clamp<std::uint64_t>(
-                    static_cast<std::uint64_t>(value) *
-                        effect.gain * globalGain_ /
-                        10000 / 10000,
-                    0,
-                    10000));
-            };
-            plan.conditions.push_back(ConditionRender{
-                command,
-                scaleSigned(effect.condition.lNegativeCoefficient),
-                scaleSigned(effect.condition.lPositiveCoefficient),
-                effect.condition.lOffset,
-                static_cast<DWORD>(effect.condition.lDeadBand),
-                scaleUnsigned(effect.condition.dwNegativeSaturation),
-                scaleUnsigned(effect.condition.dwPositiveSaturation)});
-            effect.conditionStarted = true;
-        }
-    }
-
-    RenderPlan BuildRenderPlanLocked(
-        std::chrono::steady_clock::time_point now,
-        bool renderEverything) {
-        RenderPlan plan{};
-        if (renderEverything) {
-            plan.stopAll = true;
-            lastRendered_ = 0;
-            lastPeriodicRendered_ = 0;
-            for (auto& [_, effect] : effects_) effect.conditionStarted = false;
-        }
-        plan.requiresTransport = !paused_ && actuatorsEnabled_ &&
-            std::ranges::any_of(effects_, [&](const auto& entry) {
-                const auto& effect = entry.second;
-                return effect.playing && now >= effect.startsAt;
-            });
-        if (plan.requiresTransport) plan.devicePath = devicePath_;
-        AddSoftwareRenderLocked(now, plan);
-        if (renderEverything) AddConditionRendersLocked(now, plan);
-        return plan;
-    }
-
-    HRESULT ExecuteRenderPlan(const RenderPlan& plan) noexcept {
-        if (plan.requiresTransport && !transport_.IsOpen()) {
-            const auto result = transport_.Open(plan.devicePath.c_str());
-            LogDiagnostic(
-                "LazyOpen result=0x%08lX",
-                static_cast<unsigned long>(result));
-            if (FAILED(result)) return result;
-        }
-        if (!transport_.IsOpen()) return S_OK;
-        if (plan.stopAll) {
-            const auto result = transport_.StopAll();
-            if (FAILED(result)) return result;
-        }
-        if (plan.sendConstant) {
-            const auto result = transport_.Constant(plan.constant, plan.periodic);
-            LogDiagnostic(
-                "RenderConstant value=%ld periodic=%ld result=0x%08lX",
-                static_cast<long>(plan.constant),
-                static_cast<long>(plan.periodic),
-                static_cast<unsigned long>(result));
-            if (FAILED(result)) return result;
-        }
-        for (const auto& condition : plan.conditions) {
-            const auto result = transport_.Condition(
-                condition.command,
-                condition.negativeCoefficient,
-                condition.positiveCoefficient,
-                condition.center,
-                condition.deadBand,
-                condition.negativeSaturation,
-                condition.positiveSaturation);
-            if (FAILED(result)) return result;
-        }
-        return S_OK;
-    }
-
-    void MarkRenderFailed() noexcept {
-        std::scoped_lock lock(stateMutex_);
-        lastRendered_ = std::numeric_limits<std::int32_t>::min();
-        lastPeriodicRendered_ = std::numeric_limits<std::int32_t>::min();
-        for (auto& [_, effect] : effects_) effect.conditionStarted = false;
-        renderEverythingPending_ = true;
-    }
-
-    static void ArmDeadline(EffectState& effect, DWORD iterations) noexcept {
-        effect.startsAt = std::chrono::steady_clock::now() +
-            std::chrono::microseconds(effect.startDelayUs);
-        effect.conditionStarted = false;
-        effect.hasDeadline = effect.durationUs != INFINITE;
-        if (!effect.hasDeadline) return;
-        const auto boundedIterations = iterations == INFINITE
-            ? static_cast<std::uint64_t>(UINT32_MAX)
-            : static_cast<std::uint64_t>(iterations);
-        const auto totalUs = std::min<std::uint64_t>(
-            static_cast<std::uint64_t>(effect.durationUs) * boundedIterations,
-            static_cast<std::uint64_t>(std::chrono::microseconds::max().count()));
-        effect.deadline = effect.startsAt +
-            std::chrono::microseconds(totalUs);
-    }
-
-    void TimerLoop(std::stop_token stop) noexcept {
-        std::mutex waitMutex;
-        std::unique_lock waitLock(waitMutex);
-        while (!stop.stop_requested()) {
-            timerWake_.wait_for(waitLock, kMixerPeriod);
-            if (stop.stop_requested()) break;
-
-            RenderPlan plan{};
-            {
-                std::scoped_lock lock(stateMutex_);
-                const auto now = std::chrono::steady_clock::now();
-                bool rerenderConditions = renderEverythingPending_;
-                renderEverythingPending_ = false;
-                for (auto& [_, effect] : effects_) {
-                    if (!effect.playing) continue;
-                    if (effect.hasDeadline && now >= effect.deadline) {
-                        rerenderConditions = rerenderConditions ||
-                            effect.kind == EffectKind::Spring ||
-                            effect.kind == EffectKind::Damper ||
-                            effect.kind == EffectKind::Inertia ||
-                            effect.kind == EffectKind::Friction;
-                        effect.playing = false;
-                        effect.hasDeadline = false;
-                        effect.conditionStarted = false;
-                    } else if (!effect.conditionStarted &&
-                               now >= effect.startsAt &&
-                               (effect.kind == EffectKind::Spring ||
-                                effect.kind == EffectKind::Damper ||
-                                effect.kind == EffectKind::Inertia ||
-                                effect.kind == EffectKind::Friction)) {
-                        rerenderConditions = true;
-                    }
-                }
-                plan = BuildRenderPlanLocked(now, rerenderConditions);
-            }
-            if (FAILED(ExecuteRenderPlan(plan))) MarkRenderFailed();
-        }
+    HRESULT StartSemantic(DWORD handle, DWORD iterations, bool solo, bool restart) noexcept {
+        const auto connected = EnsureConnected();
+        if (FAILED(connected)) return connected;
+        std::array<std::byte, 12> payload{};
+        Write32(payload, 0, handle);
+        Write32(payload, 4, iterations);
+        Write32(payload, 8, (solo ? 1U : 0U) | (restart ? 2U : 0U));
+        return MapResult(client_.Send(MessageType::StartEffect, payload).result);
     }
 
     std::atomic<long> references_{1};
-    BrokerTransport transport_;
-    std::mutex stateMutex_;
-    std::unordered_map<DWORD, EffectState> effects_;
+    logicontrol::ipc::SemanticClient client_;
+    mutable std::mutex identityMutex_;
     std::wstring devicePath_;
     std::atomic<DWORD> externalId_{};
-    DWORD nextHandle_{kFirstEffectHandle};
-    DWORD globalGain_{10000};
-    bool actuatorsEnabled_{true};
-    bool paused_{};
-    std::int32_t lastRendered_{};
-    std::int32_t lastPeriodicRendered_{};
-    bool renderEverythingPending_{};
-    std::condition_variable timerWake_;
-    std::jthread timer_;
+    bool profileEnabled_{};
 };
 
 class ClassFactory final : public IClassFactory {
@@ -1097,9 +405,7 @@ public:
         return E_NOINTERFACE;
     }
 
-    ULONG STDMETHODCALLTYPE AddRef() override {
-        return static_cast<ULONG>(++references_);
-    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(++references_); }
 
     ULONG STDMETHODCALLTYPE Release() override {
         const auto remaining = --references_;
@@ -1107,10 +413,7 @@ public:
         return static_cast<ULONG>(remaining);
     }
 
-    HRESULT STDMETHODCALLTYPE CreateInstance(
-        IUnknown* outer,
-        REFIID iid,
-        void** object) override {
+    HRESULT STDMETHODCALLTYPE CreateInstance(IUnknown* outer, REFIID iid, void** object) override {
         if (outer != nullptr) return CLASS_E_NOAGGREGATION;
         auto* driver = new (std::nothrow) EffectDriver();
         if (driver == nullptr) return E_OUTOFMEMORY;
@@ -1131,10 +434,7 @@ private:
 
 } // namespace
 
-STDAPI DllGetClassObject(
-    REFCLSID clsid,
-    REFIID iid,
-    void** object) {
+STDAPI DllGetClassObject(REFCLSID clsid, REFIID iid, void** object) {
     if (!IsEqualCLSID(clsid, CLSID_LogiControlFfb)) return CLASS_E_CLASSNOTAVAILABLE;
     auto* factory = new (std::nothrow) ClassFactory();
     if (factory == nullptr) return E_OUTOFMEMORY;

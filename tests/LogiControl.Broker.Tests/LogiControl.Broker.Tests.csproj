@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <Description>Dependency-free broker boundary tests.</Description>
+    <Description>xUnit v3 broker engine and runtime tests.</Description>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\LogiControl.Broker\LogiControl.Broker.csproj" />

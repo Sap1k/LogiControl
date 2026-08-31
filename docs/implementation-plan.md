@@ -66,13 +66,18 @@ provider implements `IDirectInputEffectDriver`, COM lifetime, effect parsing,
 effects, global gain, and a 2 ms mixer. Its named-pipe transport sends rendered
 constant/periodic values and condition parameters to a broker.
 
-The retained Phase 1 implementation deliberately uses an 8 ms output cadence
+The retained Phase 1 implementation deliberately used an 8 ms output cadence
 and never performs normal render IPC while holding the effect-state mutex.
 Real-game testing showed that the original synchronous callback rendering could
 stall a game's DirectInput thread; suppressing HID writes did not remove the
 stall. DirectInput callbacks now only validate and update bounded in-memory
 state. The mixer snapshots a render plan under the mutex and executes IPC after
 releasing it.
+
+The 8 ms cadence was a temporary debugging mitigation, not an observed DFGT
+hardware limit. Phase 2 deletes that provider timer. Its authoritative managed
+engine evaluates on successive 2 ms deadlines (500 Hz), while USB output is
+completion-driven and coalesced independently of the mixer rate.
 
 Provider attachment is also lazy. DirectInput enumeration and idle device
 acquisition record the HID path but do not claim the legacy broker's single FFB
@@ -221,27 +226,64 @@ termination and unplug/replug.
 
 ## Phase 2: thin provider and authoritative .NET broker
 
+Implementation status on 2026-09-01: implemented, automated-test-only. The
+semantic protocol, complete effect engine, 500 Hz scheduler, asynchronous HID
+output pump, x86/x64 thin provider, and broker-owned DFGT lifecycle are present.
+The legacy targets, device agent, and legacy wire protocol have been deleted.
+Git history is the only fallback before the next physical-wheel replay.
+
 ### Work
 
-- Replace the provider's effect table/mixer with semantic IPC.
+- Use a fixed 32-byte little-endian `LCFF` header and a maximum 64 KiB frame.
+  Keep provider requests ordered, current-user-only, bounded, and free of
+  pointers/native layouts. Connect on the first effect operation, heartbeat at
+  100 ms, and destroy the session after a 350 ms owner-lease expiry.
+- Replace the provider's effect table/mixer with semantic IPC. The provider
+  keeps only COM/DirectInput ABI translation, selected-field deep marshalling,
+  validation, result mapping, and IPC.
 - Move effect state, fake-clock-capable timing, mixer, slot allocation, gains,
   and HID encoding into `LogiControl.Broker`.
-- Mix constant, ramp, periodic, and custom effects into the constant slot.
-- Allocate the three condition slots by active effect. Map inertia and
-  unsupported friction to damper.
-- Run the mixer on a dedicated high-priority thread with a high-resolution
-  waitable timer and timing telemetry.
-- Keep an A/B development registration switch until legacy trace parity and
-  physical testing pass, then delete the legacy broker and temporary agent.
+- Mix constant, ramp, square, sine, triangle, sawtooth-up/down, and bounded
+  one-channel custom effects into firmware slot 0. Implement DirectInput
+  duration, delay, sample period, phase, iterations, envelope, direction,
+  per-effect gain, game gain, class gain, and profile master gain semantics.
+- Treat condition-slot allocation as a runtime reservation problem: active or
+  delayed spring/damper/friction/inertia effects reserve the lowest free slot
+  from 1 through 3. Downloads consume no slot. Pause retains reservations;
+  stop, destroy, natural completion, reset, session loss, or removal releases
+  them. A fourth condition returns `DIERR_DEVICEFULL`. DFGT friction is native;
+  inertia maps to damper.
+- Run the mixer on successive 2 ms QPC deadlines using a one-shot high-resolution
+  waitable timer, MMCSS `Games`/critical priority, `Highest` managed priority,
+  and a 250 microsecond deadline guard. Skip missed periods rather than burst
+  catch-up. Sleep without a timer when no effect needs evaluation.
+- Keep USB writes asynchronous and completion-driven with one write in flight.
+  Coalesce superseded slot-0 values while preserving FIFO barriers for StopAll,
+  range, autocenter, and condition stop/start/update.
+- Move discovery, calibration gating, `HidD_SetOutputReport` mode switching,
+  re-enumeration correlation, native attach, removal, recovery, range, and
+  autocenter policy into the managed broker.
+- Delete the legacy broker, legacy wire types, device agent, scripts, and CMake
+  targets after deterministic/cross-bitness/safety checks and sustained 500 Hz
+  software profiling. Completed 2026-09-01; no physical wheel was opened.
 
 ### Risks and tests
 
-Test deep serialization, malformed frames, every effect shape and lifecycle,
+Use xUnit v3 for all managed unit/integration tests. Test deep serialization,
+malformed frames, every effect shape and lifecycle,
 gain order, conditions, slot exhaustion, pause/reset/actuators, IPC loss,
 provider crash, broker restart, timing jitter, and replay of Phase 1 traces.
 
 A fourth concurrent hardware condition returns `DIERR_DEVICEFULL`; it does not
 silently replace another effect.
+
+Profiling uses QPC-correlated native TraceLogging and managed EventSource plus
+fixed-bucket aggregate histograms. Normal operation records aggregates only;
+`--profile`/`LOGICONTROL_FFB_PROFILE=1` enables per-event traces. The
+`profile-runtime` broker command runs a 16-effect, no-HID benchmark and supports
+repeat counts and CPU/GC stress. The completed evidence is recorded in
+`docs/phase2-profiling.md`; further soak testing is deferred until it informs a
+specific regression or the physical acceptance session.
 
 ### Done
 

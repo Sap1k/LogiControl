@@ -28,14 +28,10 @@ Game
   -> physical wheel
 ```
 
-The native provider should eventually contain only COM/DirectInput ABI
-translation, validation/deep serialization, and IPC. The broker is the long-term
-owner of effect state, mixing, time, profiles, safety policy, and HID output.
-
-Phase 1 deliberately retains the imported DFGT Control effect path until a
-physical DFGT has completed the C294-to-C29A and real-game acceptance flow. Do
-not combine that proof with the Phase 2 mixer move unless the implementation
-plan is explicitly revised.
+The native provider contains only COM/DirectInput ABI translation,
+validation/deep serialization, and IPC. The broker owns effect state, mixing,
+time, profiles, safety policy, device lifecycle, and HID output. The Phase 1
+device agent, native legacy broker, and legacy wire protocol have been removed.
 
 ## Device identity and mode switching
 
@@ -84,11 +80,9 @@ available for further development or validation.
 
 - `src/LogiControl.Protocol`: OS/UI-independent wheel definitions and encoders.
 - `src/LogiControl.Hid`: Windows HID, SetupAPI, and ConfigMgr interop.
-- `src/LogiControl.DeviceAgent`: temporary Phase 1 device lifecycle supervisor.
 - `src/LogiControl.Broker`: authoritative Phase 2 runtime.
 - `src/LogiControl.UI`: optional WPF broker client; it never writes HID.
 - `native/LogiControl.Ffb`: x86/x64 DirectInput COM adapter.
-- `native/LogiControl.LegacyBroker`: temporary DFGT baseline removed in Phase 2.
 - `tests`: pure unit/integration tests; physical tests live under explicit tools.
 
 Keep protocol code deterministic and testable with fake time and fake
@@ -101,7 +95,7 @@ Managed code targets .NET 10 and treats warnings as errors.
 
 ```powershell
 dotnet build .\LogiControl.slnx -c Release
-dotnet run --project .\tests\LogiControl.Protocol.Tests -c Release
+dotnet test .\LogiControl.slnx -c Release
 ```
 
 After the Visual Studio C++ workload and CMake are installed:

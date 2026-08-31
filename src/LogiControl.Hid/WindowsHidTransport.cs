@@ -9,13 +9,16 @@ namespace LogiControl.Hid;
 public sealed class WindowsHidTransport : IHidTransport
 {
     private readonly SafeFileHandle handle;
+    private readonly FileStream outputStream;
     private readonly SemaphoreSlim writeLock = new(1, 1);
+    private readonly CancellationTokenSource disposeCancellation = new();
     private bool disposed;
 
     private WindowsHidTransport(HidDeviceSnapshot device, SafeFileHandle handle)
     {
         Device = device;
         this.handle = handle;
+        outputStream = new FileStream(handle, FileAccess.Write, bufferSize: 1, isAsync: true);
     }
 
     public HidDeviceSnapshot Device { get; }
@@ -29,7 +32,7 @@ public sealed class WindowsHidTransport : IHidTransport
             NativeMethods.FileShareRead | NativeMethods.FileShareWrite,
             IntPtr.Zero,
             NativeMethods.OpenExisting,
-            0,
+            NativeMethods.FileFlagOverlapped,
             IntPtr.Zero);
         if (handle.IsInvalid)
         {
@@ -66,15 +69,15 @@ public sealed class WindowsHidTransport : IHidTransport
         CancellationToken cancellationToken = default)
     {
         byte[] buffer = ValidateAndCopy(report);
-        await writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            disposeCancellation.Token);
+        await writeLock.WaitAsync(linkedCancellation.Token).ConfigureAwait(false);
         try
         {
             ObjectDisposedException.ThrowIf(disposed, this);
-            if (!NativeMethods.WriteFile(handle, buffer, (uint)buffer.Length, out uint written, IntPtr.Zero) ||
-                written != buffer.Length)
-            {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "WriteFile HID output failed.");
-            }
+            // FileStream on a FILE_FLAG_OVERLAPPED SafeFileHandle issues completion-driven WriteFile I/O.
+            await outputStream.WriteAsync(buffer, linkedCancellation.Token).ConfigureAwait(false);
         }
         finally
         {
@@ -84,6 +87,7 @@ public sealed class WindowsHidTransport : IHidTransport
 
     public async ValueTask DisposeAsync()
     {
+        disposeCancellation.Cancel();
         await writeLock.WaitAsync().ConfigureAwait(false);
         try
         {
@@ -93,12 +97,14 @@ public sealed class WindowsHidTransport : IHidTransport
             }
 
             disposed = true;
+            await outputStream.DisposeAsync().ConfigureAwait(false);
             handle.Dispose();
         }
         finally
         {
             writeLock.Release();
             writeLock.Dispose();
+            disposeCancellation.Dispose();
         }
     }
 

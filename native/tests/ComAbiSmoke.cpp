@@ -96,14 +96,14 @@ int wmain(int argc, wchar_t** argv) {
             DICONSTANTFORCE constant{500};
             effect.cbTypeSpecificParams = sizeof(constant);
             effect.lpvTypeSpecificParams = &constant;
-            if (SUCCEEDED(driver->DownloadEffect(1, 0, &handle, &effect, DIEP_NODOWNLOAD))) {
+            if (SUCCEEDED(driver->DownloadEffect(1, 0, &handle, &effect, DIEP_ALLPARAMS | DIEP_NODOWNLOAD))) {
                 ++validatedEffects;
             }
 
             DIRAMPFORCE ramp{-500, 500};
             effect.cbTypeSpecificParams = sizeof(ramp);
             effect.lpvTypeSpecificParams = &ramp;
-            if (SUCCEEDED(driver->DownloadEffect(1, 1, &handle, &effect, DIEP_NODOWNLOAD))) {
+            if (SUCCEEDED(driver->DownloadEffect(1, 1, &handle, &effect, DIEP_ALLPARAMS | DIEP_NODOWNLOAD))) {
                 ++validatedEffects;
             }
 
@@ -116,7 +116,7 @@ int wmain(int argc, wchar_t** argv) {
                         effectId,
                         &handle,
                         &effect,
-                        DIEP_NODOWNLOAD))) {
+                        DIEP_ALLPARAMS | DIEP_NODOWNLOAD))) {
                     ++validatedEffects;
                 }
             }
@@ -126,7 +126,7 @@ int wmain(int argc, wchar_t** argv) {
                 3,
                 &handle,
                 &effect,
-                DIEP_NODOWNLOAD));
+                DIEP_ALLPARAMS | DIEP_NODOWNLOAD));
 
             DICONDITION condition{};
             condition.lPositiveCoefficient = 1000;
@@ -141,7 +141,7 @@ int wmain(int argc, wchar_t** argv) {
                         effectId,
                         &handle,
                         &effect,
-                        DIEP_NODOWNLOAD))) {
+                        DIEP_ALLPARAMS | DIEP_NODOWNLOAD))) {
                     ++validatedEffects;
                 }
             }
@@ -160,7 +160,7 @@ int wmain(int argc, wchar_t** argv) {
                     0x100,
                     &handle,
                     &effect,
-                    DIEP_NODOWNLOAD))) {
+                    DIEP_ALLPARAMS | DIEP_NODOWNLOAD))) {
                 ++validatedEffects;
             }
             custom.cChannels = 2;
@@ -169,7 +169,7 @@ int wmain(int argc, wchar_t** argv) {
                 0x100,
                 &handle,
                 &effect,
-                DIEP_NODOWNLOAD));
+                DIEP_ALLPARAMS | DIEP_NODOWNLOAD));
             driver->SendForceFeedbackCommand(1, DISFFC_STOPALL);
             driver->DeviceID(0x0800, 1, FALSE, 0, &init);
         } else if (SUCCEEDED(result) && !openOnly) {
@@ -188,7 +188,7 @@ int wmain(int argc, wchar_t** argv) {
             effect.cbTypeSpecificParams = sizeof(constant);
             effect.lpvTypeSpecificParams = &constant;
             DWORD handle = 0;
-            result = driver->DownloadEffect(1, 0, &handle, &effect, 0);
+            result = driver->DownloadEffect(1, 0, &handle, &effect, DIEP_ALLPARAMS);
             // OEM driver ABI order is mode, then iterations. This is the
             // ordering used by the DirectInput runtime.
             if (SUCCEEDED(result)) result = driver->StartEffect(1, handle, 0, 1);

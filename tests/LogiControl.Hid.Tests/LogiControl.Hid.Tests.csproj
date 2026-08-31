@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <Description>Dependency-free Windows HID contract tests.</Description>
+    <Description>xUnit v3 Windows HID contract tests.</Description>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\LogiControl.Hid\LogiControl.Hid.csproj" />

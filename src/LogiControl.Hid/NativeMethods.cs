@@ -185,15 +185,6 @@ internal static partial class NativeMethods
         byte[] reportBuffer,
         uint reportBufferLength);
 
-    [LibraryImport("kernel32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    internal static partial bool WriteFile(
-        SafeFileHandle file,
-        byte[] buffer,
-        uint bytesToWrite,
-        out uint bytesWritten,
-        IntPtr overlapped);
-
     [LibraryImport("cfgmgr32.dll", EntryPoint = "CM_Get_DevNode_PropertyW")]
     internal static unsafe partial int CmGetDevNodeProperty(
         uint deviceInstance,

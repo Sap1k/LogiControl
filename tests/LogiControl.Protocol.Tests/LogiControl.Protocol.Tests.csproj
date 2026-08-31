@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <Description>Dependency-free protocol golden-vector tests.</Description>
+    <Description>xUnit v3 protocol golden-vector tests.</Description>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\LogiControl.Protocol\LogiControl.Protocol.csproj" />

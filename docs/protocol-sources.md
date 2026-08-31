@@ -26,3 +26,16 @@ Protocol facts should be expressed independently and covered by golden vectors.
 When implementation is adapted closely from upstream code, add source-file
 headers and `THIRD_PARTY_NOTICES.md` entries rather than relying on this index
 alone.
+
+Phase 2 provenance details:
+
+- The managed DFGT constant/spring/damper/friction report scaling and packing
+  preserve the imported DFGT Control behavior and shared golden vectors. That
+  translation remains covered by the DFGT Control MIT notice.
+- Effect timing, four-slot division, class gains, native friction, inertia-to-
+  damper behavior, autocenter strategy, and output backpressure were expressed
+  for this architecture from the pinned `new-lg4ff` behavior. Source headers
+  identify this behavioral provenance; no Linux kernel structures or code are
+  copied into the ABI or IPC.
+- DirectInput structure/mask/waveform semantics are normative from Microsoft;
+  upstream behavior is corrected where it conflicts with DirectInput.
