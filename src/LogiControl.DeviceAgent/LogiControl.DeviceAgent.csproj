@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <Description>Phase 1 wheel discovery and native-mode lifecycle supervisor.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\LogiControl.Hid\LogiControl.Hid.csproj" />
+    <ProjectReference Include="..\LogiControl.Protocol\LogiControl.Protocol.csproj" />
+  </ItemGroup>
+</Project>

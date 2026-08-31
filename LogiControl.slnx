@@ -1,0 +1,15 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/LogiControl.Protocol/LogiControl.Protocol.csproj" />
+    <Project Path="src/LogiControl.Hid/LogiControl.Hid.csproj" />
+    <Project Path="src/LogiControl.DeviceAgent/LogiControl.DeviceAgent.csproj" />
+    <Project Path="src/LogiControl.Broker/LogiControl.Broker.csproj" />
+    <Project Path="src/LogiControl.UI/LogiControl.UI.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/LogiControl.Protocol.Tests/LogiControl.Protocol.Tests.csproj" />
+    <Project Path="tests/LogiControl.Hid.Tests/LogiControl.Hid.Tests.csproj" />
+    <Project Path="tests/LogiControl.Broker.Tests/LogiControl.Broker.Tests.csproj" />
+    <Project Path="tests/LogiControl.IntegrationTests/LogiControl.IntegrationTests.csproj" />
+  </Folder>
+</Solution>

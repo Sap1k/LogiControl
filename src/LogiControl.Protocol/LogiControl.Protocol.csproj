@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>OS-independent Logitech wheel definitions and command encoders.</Description>
+  </PropertyGroup>
+</Project>

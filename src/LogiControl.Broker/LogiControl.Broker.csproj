@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <Description>Per-user LogiControl device and force-feedback broker.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\LogiControl.Hid\LogiControl.Hid.csproj" />
+    <ProjectReference Include="..\LogiControl.Protocol\LogiControl.Protocol.csproj" />
+  </ItemGroup>
+</Project>

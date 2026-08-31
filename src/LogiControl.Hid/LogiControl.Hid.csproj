@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Windows HID, SetupAPI, and ConfigMgr transport abstractions.</Description>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\LogiControl.Protocol\LogiControl.Protocol.csproj" />
+  </ItemGroup>
+</Project>

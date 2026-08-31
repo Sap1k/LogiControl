@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <UseWPF>true</UseWPF>
+    <Description>Optional LogiControl settings and diagnostics client.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\LogiControl.Protocol\LogiControl.Protocol.csproj" />
+  </ItemGroup>
+</Project>

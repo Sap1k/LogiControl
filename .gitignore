@@ -1,0 +1,30 @@
+# .NET
+**/bin/
+**/obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Native builds
+out/
+build/
+CMakeUserPresets.json
+.vs/
+
+# Test and coverage output
+TestResults/
+coverage/
+artifacts/
+
+# IDEs and operating system
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local hardware diagnostics and captures
+*.etl
+*.pcap
+*.pcapng
+hardware-logs/

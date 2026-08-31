@@ -1,0 +1,26 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<Window x:Class="LogiControl.UI.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="LogiControl" Height="360" Width="640"
+        MinHeight="300" MinWidth="520"
+        WindowStartupLocation="CenterScreen">
+    <Grid Margin="32">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+        <TextBlock FontSize="28" FontWeight="SemiBold" Text="LogiControl" />
+        <TextBlock Grid.Row="1" Margin="0,12,0,0" FontSize="15"
+                   Text="Classic Logitech wheel support through the Windows HID stack." />
+        <Border Grid.Row="2" Margin="0,28,0,0" Padding="20"
+                BorderBrush="#FFD6D6D6" BorderThickness="1" CornerRadius="6">
+            <StackPanel>
+                <TextBlock FontWeight="SemiBold" Text="Bootstrap status" />
+                <TextBlock Margin="0,8,0,0" TextWrapping="Wrap"
+                           Text="The UI shell is ready. Device discovery and broker IPC will be added after the hardware-safe transport layer." />
+            </StackPanel>
+        </Border>
+    </Grid>
+</Window>

@@ -1,0 +1,5 @@
+; SPDX-License-Identifier: MIT
+; Adapted from DFGT Control commit 426d7007a1d40e4d2de5c5873959620f9066ec1c.
+EXPORTS
+    DllCanUnloadNow PRIVATE
+    DllGetClassObject PRIVATE

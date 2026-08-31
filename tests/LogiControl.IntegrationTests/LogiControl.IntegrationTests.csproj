@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <Description>Dependency-free, hardware-free component integration tests.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\LogiControl.DeviceAgent\LogiControl.DeviceAgent.csproj" />
+  </ItemGroup>
+</Project>

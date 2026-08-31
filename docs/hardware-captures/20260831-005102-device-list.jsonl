@@ -1,0 +1,29 @@
+[
+  {
+    "devicePath": "\\\\?\\hid#vid_046d\u0026pid_c29a#7\u002622f71863\u00260\u00260000#{4d1e55b2-f16f-11cf-88cb-001111000030}",
+    "instanceId": "HID\\VID_046D\u0026PID_C29A\\7\u002622F71863\u00260\u00260000",
+    "vendorId": 1133,
+    "productId": 49818,
+    "versionNumber": 4902,
+    "usagePage": 1,
+    "usage": 4,
+    "inputReportByteLength": 9,
+    "outputReportByteLength": 8,
+    "featureReportByteLength": 132,
+    "containerId": "1e9b4efe-a4ae-11f1-b40b-f068e3c9787d",
+    "locationPaths": [
+      "PCIROOT(0)#PCI(0803)#PCI(0000)#USBROOT(0)#USB(2)",
+      "ACPI(_SB_)#ACPI(PCI0)#ACPI(GPPC)#ACPI(XHC0)#ACPI(RHUB)#ACPI(PRT2)"
+    ],
+    "parentInstanceId": "USB\\VID_046D\u0026PID_C29A\\6\u0026A61A827\u00260\u00262",
+    "busReportedDescription": "Driving Force GT",
+    "driverService": "HidUsb",
+    "driverProvider": "Microsoft",
+    "driverInfPath": "input.inf",
+    "effectiveLocationPaths": [
+      "PCIROOT(0)#PCI(0803)#PCI(0000)#USBROOT(0)#USB(2)",
+      "ACPI(_SB_)#ACPI(PCI0)#ACPI(GPPC)#ACPI(XHC0)#ACPI(RHUB)#ACPI(PRT2)"
+    ],
+    "isJoystick": true
+  }
+]
