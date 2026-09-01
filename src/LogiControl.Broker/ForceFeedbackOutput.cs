@@ -140,6 +140,7 @@ public sealed class CoalescingHidOutputPump : IForceFeedbackOutputSink
     private long desiredPublishedAt;
     private long desiredVersion;
     private long submittedVersion;
+    private bool slotZeroStarted;
     private Exception? failure;
     private bool disposed;
     private int transportClosed;
@@ -274,6 +275,12 @@ public sealed class CoalescingHidOutputPump : IForceFeedbackOutputSink
                     try
                     {
                         Write(barrier.Report, barrier.PublishedAtMicroseconds);
+                        if (barrier.ForceResetVersion is long forceResetVersion)
+                        {
+                            slotZeroStarted = false;
+                            AdvanceSubmittedVersion(forceResetVersion);
+                        }
+
                         barrier.Completion?.TrySetResult();
                     }
                     catch (Exception exception)
@@ -286,8 +293,17 @@ public sealed class CoalescingHidOutputPump : IForceFeedbackOutputSink
                 long version = Interlocked.Read(ref desiredVersion);
                 if (version != submittedVersion)
                 {
-                    DfgtForceFeedbackReports.WriteConstant(constantReport, 0, FirmwareSlotOperation.Update, Volatile.Read(ref desiredForce));
-                    Write(constantReport, Volatile.Read(ref desiredPublishedAt));
+                    int force = Volatile.Read(ref desiredForce);
+                    if (force != 0 || slotZeroStarted)
+                    {
+                        FirmwareSlotOperation operation = slotZeroStarted
+                            ? FirmwareSlotOperation.Update
+                            : FirmwareSlotOperation.Start;
+                        DfgtForceFeedbackReports.WriteConstant(constantReport, 0, operation, force);
+                        Write(constantReport, Volatile.Read(ref desiredPublishedAt));
+                        slotZeroStarted = true;
+                    }
+
                     Interlocked.Exchange(ref submittedVersion, version);
                     if (Interlocked.Read(ref desiredVersion) != version)
                     {
@@ -358,13 +374,36 @@ public sealed class CoalescingHidOutputPump : IForceFeedbackOutputSink
             throw new ArgumentException("DFGT reports must be exactly eight bytes.", nameof(report));
         }
 
-        barriers.Enqueue(new PendingReport(report.ToArray(), clock.GetMicroseconds(), completion));
+        long? forceResetVersion = IsSlotZeroReset(report)
+            ? Interlocked.Read(ref desiredVersion)
+            : null;
+        barriers.Enqueue(new PendingReport(
+            report.ToArray(),
+            clock.GetMicroseconds(),
+            completion,
+            forceResetVersion));
         Telemetry.RecordBarrierPublication(barriers.Count);
         wake.Set();
     }
 
+    private void AdvanceSubmittedVersion(long version)
+    {
+        while (true)
+        {
+            long current = Interlocked.Read(ref submittedVersion);
+            if (current >= version || Interlocked.CompareExchange(ref submittedVersion, version, current) == current)
+            {
+                return;
+            }
+        }
+    }
+
+    private static bool IsSlotZeroReset(ReadOnlySpan<byte> report) =>
+        report[1] is 0xF3 or 0x13;
+
     private readonly record struct PendingReport(
         byte[] Report,
         long PublishedAtMicroseconds,
-        TaskCompletionSource? Completion);
+        TaskCompletionSource? Completion,
+        long? ForceResetVersion);
 }

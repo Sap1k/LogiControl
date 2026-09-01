@@ -319,6 +319,7 @@ public sealed class BrokerRequestDispatcher
 
         GlobalBrokerStatus status = runtime.Invoke(coordinator.QueryGlobalStatus, TimeSpan.FromMilliseconds(250));
         Span<byte> extra = stackalloc byte[24];
+        extra.Clear();
         BinaryPrimitives.WriteUInt64LittleEndian(extra, status.OwnerSessionId);
         BinaryPrimitives.WriteInt32LittleEndian(extra[8..], status.SessionCount);
         BinaryPrimitives.WriteInt32LittleEndian(extra[12..], status.DownloadedEffectCount);
@@ -336,6 +337,7 @@ public sealed class BrokerRequestDispatcher
 
         RuntimeTelemetry telemetry = runtime.Telemetry;
         Span<byte> extra = stackalloc byte[104];
+        extra.Clear();
         BinaryPrimitives.WriteInt64LittleEndian(extra, telemetry.Ticks);
         BinaryPrimitives.WriteInt64LittleEndian(extra[8..], telemetry.MissedDeadlines);
         BinaryPrimitives.WriteInt64LittleEndian(extra[16..], telemetry.Overruns);

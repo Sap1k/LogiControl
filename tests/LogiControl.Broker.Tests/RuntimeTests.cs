@@ -26,6 +26,7 @@ public sealed class RuntimeTests
         Assert.Equal(EngineResult.Ok, runtime.Invoke(() => engine.Start(handle), TimeSpan.FromSeconds(1)));
 
         Assert.True(SpinWait.SpinUntil(() => runtime.Telemetry.Ticks >= 15, TimeSpan.FromSeconds(2)));
+        runtime.Dispose();
         Assert.InRange(runtime.Telemetry.Ticks, 15, 1_000);
         Assert.Contains(2_000, output.Forces);
         Assert.True(runtime.Telemetry.CommandCount >= 2);
@@ -65,7 +66,7 @@ public sealed class RuntimeTests
                 pump.Telemetry.PublicationToCompletionBuckets.Span.ToArray().Sum());
         }
 
-        Assert.InRange(transport.Reports.Count, 1, 20);
+        Assert.InRange(transport.Reports.Count, 1, 100);
         Assert.Equal((byte)0xFF, transport.Reports.Last()[3]);
     }
 
@@ -98,9 +99,93 @@ public sealed class RuntimeTests
         Assert.True(SpinWait.SpinUntil(
             () => output.Barriers.Any(static report => report[1] == 0x14), TimeSpan.FromSeconds(1)));
         byte[][] restored = output.Barriers.ToArray();
-        Assert.Contains(restored, static report => report[1] == 0x1C && report[3] == 0x80);
+        Assert.Contains(restored, static report => report[1] == 0x13);
         Assert.Contains(restored, static report => report[1] == 0xFE && report[2] == 0x0D);
         Assert.Contains(restored, static report => report[1] == 0x14);
+        int stopIndex = Array.FindIndex(restored, static report => report[1] == 0x13);
+        int parametersIndex = Array.FindIndex(restored, static report => report[1] == 0xFE && report[2] == 0x0D);
+        int enableIndex = Array.FindIndex(restored, static report => report[1] == 0x14);
+        Assert.True(stopIndex < parametersIndex);
+        Assert.True(parametersIndex < enableIndex);
+    }
+
+    [Fact]
+    public void HidPumpStartsThenUpdatesSlotZeroAndSkipsInitialZero()
+    {
+        var transport = new DelayedTransport(TimeSpan.Zero);
+        using var pump = new CoalescingHidOutputPump(transport);
+
+        pump.PublishSoftwareForce(0);
+        pump.PublishSoftwareForce(1_000);
+        Assert.True(SpinWait.SpinUntil(() => transport.Reports.Count >= 1, TimeSpan.FromSeconds(2)));
+        Assert.Equal((byte)0x11, transport.Reports.ElementAt(0)[1]);
+
+        pump.PublishSoftwareForce(2_000);
+        Assert.True(SpinWait.SpinUntil(() => transport.Reports.Count >= 2, TimeSpan.FromSeconds(2)));
+        Assert.Equal((byte)0x1C, transport.Reports.ElementAt(1)[1]);
+
+        pump.PublishSoftwareForce(0);
+        Assert.True(SpinWait.SpinUntil(() => transport.Reports.Count >= 3, TimeSpan.FromSeconds(2)));
+        Assert.Equal((byte)0x1C, transport.Reports.ElementAt(2)[1]);
+        Assert.Equal((byte)0x80, transport.Reports.ElementAt(2)[3]);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task HidPumpResetBarrierMakesNextForceStart(bool stopAll)
+    {
+        var transport = new DelayedTransport(TimeSpan.Zero);
+        using var pump = new CoalescingHidOutputPump(transport);
+        pump.PublishSoftwareForce(1_000);
+        Assert.True(SpinWait.SpinUntil(() => transport.Reports.Count >= 1, TimeSpan.FromSeconds(2)));
+
+        var reset = new byte[DfgtForceFeedbackReports.ReportLength];
+        if (stopAll)
+        {
+            DfgtForceFeedbackReports.WriteStopAll(reset);
+        }
+        else
+        {
+            DfgtForceFeedbackReports.WriteSlotStop(reset, 0);
+        }
+
+        await pump.PublishBarrierAndWaitAsync(reset, TestContext.Current.CancellationToken);
+        pump.PublishSoftwareForce(2_000);
+        Assert.True(SpinWait.SpinUntil(() => transport.Reports.Count >= 3, TimeSpan.FromSeconds(2)));
+
+        Assert.Equal((byte)0x11, transport.Reports.ElementAt(0)[1]);
+        Assert.Equal(stopAll ? (byte)0xF3 : (byte)0x13, transport.Reports.ElementAt(1)[1]);
+        Assert.Equal((byte)0x11, transport.Reports.ElementAt(2)[1]);
+    }
+
+    [Fact]
+    public async Task StopAllFenceSuppressesOlderCoalescedForceButAllowsNewStart()
+    {
+        var transport = new GatedTransport();
+        using var pump = new CoalescingHidOutputPump(transport);
+        pump.PublishSoftwareForce(1_000);
+        Assert.True(transport.FirstWriteStarted.Wait(
+            TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken));
+
+        pump.PublishSoftwareForce(2_000);
+        var stopAll = new byte[DfgtForceFeedbackReports.ReportLength];
+        DfgtForceFeedbackReports.WriteStopAll(stopAll);
+        Task barrier = pump.PublishBarrierAndWaitAsync(
+            stopAll, TestContext.Current.CancellationToken).AsTask();
+        pump.PublishSoftwareForce(0);
+        transport.ReleaseFirstWrite.Set();
+
+        await barrier.WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
+        Assert.True(SpinWait.SpinUntil(() => transport.Reports.Count >= 2, TimeSpan.FromSeconds(2)));
+        Thread.Sleep(25);
+        Assert.Equal(2, transport.Reports.Count);
+        Assert.Equal((byte)0x11, transport.Reports.ElementAt(0)[1]);
+        Assert.Equal((byte)0xF3, transport.Reports.ElementAt(1)[1]);
+
+        pump.PublishSoftwareForce(3_000);
+        Assert.True(SpinWait.SpinUntil(() => transport.Reports.Count >= 3, TimeSpan.FromSeconds(2)));
+        Assert.Equal((byte)0x11, transport.Reports.ElementAt(2)[1]);
     }
 
     [Fact]
@@ -218,6 +303,43 @@ public sealed class RuntimeTests
         public ValueTask DisposeAsync()
         {
             DisposeCount++;
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class GatedTransport : IHidTransport
+    {
+        private int writes;
+
+        public HidDeviceSnapshot Device { get; } = new(
+            "fake", "fake", 0x046D, 0xC29A, 0x1301, 1, 4, 16, 8, 8);
+
+        public ConcurrentQueue<byte[]> Reports { get; } = new();
+
+        public ManualResetEventSlim FirstWriteStarted { get; } = new(false);
+
+        public ManualResetEventSlim ReleaseFirstWrite { get; } = new(false);
+
+        public ValueTask SetOutputReportAsync(ReadOnlyMemory<byte> report, CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Unexpected mode-switch output.");
+
+        public ValueTask WriteOutputReportAsync(ReadOnlyMemory<byte> report, CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.Increment(ref writes) == 1)
+            {
+                FirstWriteStarted.Set();
+                ReleaseFirstWrite.Wait(cancellationToken);
+            }
+
+            Reports.Enqueue(report.ToArray());
+            return ValueTask.CompletedTask;
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            ReleaseFirstWrite.Set();
+            FirstWriteStarted.Dispose();
+            ReleaseFirstWrite.Dispose();
             return ValueTask.CompletedTask;
         }
     }

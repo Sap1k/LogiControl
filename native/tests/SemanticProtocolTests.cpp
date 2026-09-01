@@ -4,6 +4,7 @@
 #include <iostream>
 
 #include "../LogiControl.SemanticIpc/SemanticProtocol.h"
+#include "../LogiControl.SemanticIpc/MonotonicClock.h"
 
 namespace {
 
@@ -71,6 +72,12 @@ int main() {
         static_cast<std::int32_t>(detail::Read32(customBytes, 32)) == -10'000,
         "Custom effect payload differs.");
 
-    std::cout << "{\"semanticProtocolVectors\":3,\"passed\":true}\n";
+    constexpr std::uint64_t overflowBoundary = 9'223'372'036'854ULL;
+    Require(detail::ScaleTicksToMicroseconds(overflowBoundary, 10'000'000ULL) == 922'337'203'685ULL &&
+        detail::ScaleTicksToMicroseconds(overflowBoundary + 10'000'000ULL, 10'000'000ULL) ==
+            922'338'203'685ULL,
+        "QPC scaling differs across the former multiplication-overflow boundary.");
+
+    std::cout << "{\"semanticProtocolVectors\":4,\"passed\":true}\n";
     return 0;
 }

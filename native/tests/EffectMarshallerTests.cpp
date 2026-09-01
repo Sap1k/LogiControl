@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <dinput.h>
 
+#include <array>
 #include <cstdlib>
 #include <iostream>
 
@@ -61,6 +62,40 @@ int main() {
         periodicDefinition.magnitude == 8000 && allMask == EffectUpdateMask::All,
         "Complete periodic semantic fields differ.");
 
+    constexpr std::array<DWORD, 3> directionEffectIds{ConstantEffectId, SineEffectId, SpringEffectId};
+    constexpr std::array<LONG, 5> directionInputs{1, 10000, 0, -1, -10000};
+    constexpr std::array<std::int32_t, 5> expectedDirections{10000, 10000, 10000, -10000, -10000};
+    for (const auto effectId : directionEffectIds) {
+        for (std::size_t index = 0; index < directionInputs.size(); ++index) {
+            LONG input = directionInputs[index];
+            DIEFFECT directionOnly{};
+            directionOnly.dwSize = sizeof(directionOnly);
+            directionOnly.dwFlags = DIEFF_CARTESIAN;
+            directionOnly.cAxes = 1;
+            directionOnly.rglDirection = &input;
+            EffectDefinition directionDefinition{};
+            EffectUpdateMask directionMask{};
+            Require(SUCCEEDED(MarshalEffect(
+                effectId, directionOnly, DIEP_DIRECTION, directionDefinition, directionMask)),
+                "Valid Cartesian direction failed to marshal.");
+            Require(directionDefinition.direction == expectedDirections[index] &&
+                directionMask == EffectUpdateMask::Direction,
+                "Cartesian direction was not normalized to its one-axis sign.");
+        }
+    }
+
+    LONG outOfRangeDirection = 10001;
+    DIEFFECT invalidDirection{};
+    invalidDirection.dwSize = sizeof(invalidDirection);
+    invalidDirection.dwFlags = DIEFF_CARTESIAN;
+    invalidDirection.cAxes = 1;
+    invalidDirection.rglDirection = &outOfRangeDirection;
+    EffectDefinition invalidDirectionDefinition{};
+    EffectUpdateMask invalidDirectionMask{};
+    Require(MarshalEffect(ConstantEffectId, invalidDirection, DIEP_DIRECTION,
+        invalidDirectionDefinition, invalidDirectionMask) == DIERR_INVALIDPARAM,
+        "Out-of-range Cartesian direction was accepted.");
+
     DICUSTOMFORCE malicious{};
     malicious.cChannels = 1;
     malicious.dwSamplePeriod = 1000;
@@ -95,6 +130,6 @@ int main() {
     Require(customDefinition.samplePeriodMicroseconds == 2000 && customDefinition.customSamples.size() == 3,
         "Custom sample data or period was not copied semantically.");
 
-    std::cout << "{\"effectMarshallerCases\":5,\"passed\":true}\n";
+    std::cout << "{\"effectMarshallerCases\":6,\"passed\":true}\n";
     return 0;
 }

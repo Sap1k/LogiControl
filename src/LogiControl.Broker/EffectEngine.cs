@@ -548,7 +548,8 @@ public sealed class EffectEngine : IRuntimeMixer
     private static long EvaluatePeriodic(PeriodicEffectDefinition periodic, long local)
     {
         ulong phase = ((ulong)(periodic.PhaseHundredthsOfDegree % 36_000) << 32) / 36_000;
-        phase += ((ulong)local << 32) / periodic.PeriodMicroseconds;
+        ulong cycleMicroseconds = (ulong)local % periodic.PeriodMicroseconds;
+        phase += (cycleMicroseconds << 32) / periodic.PeriodMicroseconds;
         uint turn = (uint)phase;
         int unit = periodic.Waveform switch
         {

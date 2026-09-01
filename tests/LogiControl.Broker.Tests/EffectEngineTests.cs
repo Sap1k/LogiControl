@@ -107,6 +107,31 @@ public sealed class EffectEngineTests
     }
 
     [Fact]
+    public void InfinitePeriodicEffectPreservesPhaseAcrossFixedPointRollover()
+    {
+        const long rollover = 1L << 32;
+        const uint period = 7_001;
+
+        foreach (long offset in new[] { -1L, 0L, 1L })
+        {
+            long elapsed = rollover + offset;
+            Assert.Equal(RenderSineAt(elapsed % period), RenderSineAt(elapsed));
+        }
+
+        static int RenderSineAt(long elapsed)
+        {
+            var clock = new FakeClock();
+            var engine = new EffectEngine(clock);
+            engine.Upsert(0, new PeriodicEffectDefinition(
+                Common(EffectCommon.InfiniteDuration), ForceEffectKind.Sine, 10_000, 0, 0, period),
+                false, out uint handle);
+            engine.Start(handle);
+            clock.Now = elapsed;
+            return engine.Render().SoftwareForce;
+        }
+    }
+
+    [Fact]
     public void PauseFreezesEffectTime()
     {
         var clock = new FakeClock();

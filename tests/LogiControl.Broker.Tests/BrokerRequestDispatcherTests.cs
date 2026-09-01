@@ -111,10 +111,28 @@ public sealed class BrokerRequestDispatcherTests
         Assert.Equal(2, BinaryPrimitives.ReadInt32LittleEndian(status.Payload.AsSpan(12)));
         Assert.Equal(1, BinaryPrimitives.ReadInt32LittleEndian(status.Payload.AsSpan(16)));
         Assert.Equal(3u, BinaryPrimitives.ReadUInt32LittleEndian(status.Payload.AsSpan(20)));
+        Assert.All(status.Payload.AsSpan(24, 4).ToArray(), static value => Assert.Equal((byte)0, value));
 
         Assert.Equal(BrokerResult.Ok, Result(fixture.Dispatcher.Dispatch(
             Request(IpcMessageType.EmergencyStop, 3, hello.Header.SessionId, []))));
         Assert.Equal((ulong)0, fixture.Invoke(() => fixture.Coordinator.OwnerSessionId));
+    }
+
+    [Fact]
+    public void TelemetryWithoutOutputSinkReturnsZeroedOutputCounters()
+    {
+        using var fixture = new RuntimeFixture(deviceReady: true);
+        IpcFrame hello = fixture.Dispatcher.Dispatch(Request(IpcMessageType.Hello, 1, 0, []));
+
+        for (ulong requestId = 2; requestId < 12; requestId++)
+        {
+            IpcFrame telemetry = fixture.Dispatcher.Dispatch(
+                Request(IpcMessageType.QueryTelemetry, requestId, hello.Header.SessionId, []));
+            Assert.Equal(BrokerResult.Ok, Result(telemetry));
+            Assert.Equal(108, telemetry.Payload.Length);
+            Assert.All(telemetry.Payload.AsSpan(52, 56).ToArray(),
+                static value => Assert.Equal((byte)0, value));
+        }
     }
 
     [Fact]

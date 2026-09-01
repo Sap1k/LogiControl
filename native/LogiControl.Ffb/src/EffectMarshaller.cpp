@@ -156,7 +156,7 @@ HRESULT MarshalEffect(
             (source.dwFlags & DIEFF_CARTESIAN) == 0 || !SignedMagnitude(source.rglDirection[0])) {
             return DIERR_INVALIDPARAM;
         }
-        target.direction = source.rglDirection[0];
+        target.direction = source.rglDirection[0] < 0 ? -10000 : 10000;
         AddMask(updateMask, EffectUpdateMask::Direction);
     }
     if ((flags & DIEP_ENVELOPE) != 0) {

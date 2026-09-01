@@ -8,4 +8,7 @@
     <ProjectReference Include="..\LogiControl.Hid\LogiControl.Hid.csproj" />
     <ProjectReference Include="..\LogiControl.Protocol\LogiControl.Protocol.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="LogiControl.Broker.Tests" />
+  </ItemGroup>
 </Project>

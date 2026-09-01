@@ -286,10 +286,9 @@ public sealed partial class EffectRuntime : IDisposable
         {
             if (hadActiveEffects)
             {
-                Span<byte> zero = stackalloc byte[Protocol.DfgtForceFeedbackReports.ReportLength];
-                Protocol.DfgtForceFeedbackReports.WriteConstant(
-                    zero, 0, Protocol.FirmwareSlotOperation.Update, 0);
-                output.PublishBarrier(zero);
+                Span<byte> stop = stackalloc byte[Protocol.DfgtForceFeedbackReports.ReportLength];
+                Protocol.DfgtForceFeedbackReports.WriteSlotStop(stop, 0);
+                output.PublishBarrier(stop);
             }
 
             Span<byte> autocenter = stackalloc byte[Protocol.DfgtForceFeedbackReports.ReportLength];

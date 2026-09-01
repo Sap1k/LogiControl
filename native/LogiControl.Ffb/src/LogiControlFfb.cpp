@@ -17,6 +17,7 @@
 #include <TraceLoggingProvider.h>
 
 #include "EffectMarshaller.h"
+#include "../../LogiControl.SemanticIpc/MonotonicClock.h"
 #include "../../LogiControl.SemanticIpc/SemanticClient.h"
 
 TRACELOGGING_DEFINE_PROVIDER(
@@ -47,19 +48,11 @@ bool ProfileRequested() noexcept {
     return GetEnvironmentVariableW(L"LOGICONTROL_FFB_PROFILE", value, 2) == 1 && value[0] == L'1';
 }
 
-std::uint64_t QpcMicroseconds() noexcept {
-    LARGE_INTEGER counter{};
-    LARGE_INTEGER frequency{};
-    QueryPerformanceCounter(&counter);
-    QueryPerformanceFrequency(&frequency);
-    return static_cast<std::uint64_t>(counter.QuadPart * 1'000'000LL / frequency.QuadPart);
-}
-
 class CallbackTrace final {
 public:
     explicit CallbackTrace(const char* callback) noexcept
         : callback_(callback), enabled_(g_profileDrivers.load(std::memory_order_relaxed) > 0),
-          started_(enabled_ ? QpcMicroseconds() : 0) {}
+          started_(enabled_ ? logicontrol::ipc::detail::QpcMicroseconds() : 0) {}
 
     ~CallbackTrace() {
         if (!enabled_) return;
@@ -67,7 +60,8 @@ public:
             g_providerTelemetry,
             "ProviderCallback",
             TraceLoggingString(callback_, "Callback"),
-            TraceLoggingUInt64(QpcMicroseconds() - started_, "DurationMicroseconds"));
+            TraceLoggingUInt64(
+                logicontrol::ipc::detail::QpcMicroseconds() - started_, "DurationMicroseconds"));
     }
 
 private:

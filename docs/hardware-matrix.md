@@ -77,6 +77,17 @@ test tool/game, and whether the result was repeatable after a cold reconnect.
 
 ## Deferred Phase 2 DFGT acceptance
 
+- Replay the corrected slot-zero lifecycle: first nonzero software force uses
+  `Start`, subsequent values use `Update`, and idle/StopAll resets require a new
+  `Start`. Automated fake-transport tests cover the normal sequence and a
+  gated stale-force race; physical behavior remains unverified.
+- Confirm DirectInput one-axis directions supplied as `1`, `-1`, and `0`
+  produce full positive, full negative, and legacy-positive orientation after
+  native sign normalization. Native marshalling vectors cover this without
+  generating force.
+- Run an infinite periodic effect beyond the former 71.6-minute fixed-point
+  rollover and confirm phase continuity. Deterministic fake-clock tests cover
+  the rollover boundary; long-running hardware output remains unverified.
 - Mode switch, calibration, managed attach initialization, StopAll, 2 ms
   runtime, range, reconnect, removal, and HID-fault recovery.
 - Low-force constant, ramp, square, sine, triangle, sawtooth-up/down, custom,

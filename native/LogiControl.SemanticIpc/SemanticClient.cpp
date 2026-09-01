@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "SemanticClient.h"
+#include "MonotonicClock.h"
 
 #include <algorithm>
 #include <array>
@@ -23,18 +24,11 @@ bool ProfileRequested() noexcept {
     return GetEnvironmentVariableW(L"LOGICONTROL_FFB_PROFILE", value, 2) == 1 && value[0] == L'1';
 }
 
-std::uint64_t QpcMicroseconds() noexcept {
-    LARGE_INTEGER counter{};
-    LARGE_INTEGER frequency{};
-    QueryPerformanceCounter(&counter);
-    QueryPerformanceFrequency(&frequency);
-    return static_cast<std::uint64_t>(counter.QuadPart * 1'000'000LL / frequency.QuadPart);
-}
-
 class IpcTrace final {
 public:
     explicit IpcTrace(MessageType type) noexcept
-        : type_(type), enabled_(g_profileClients.load(std::memory_order_relaxed) > 0), started_(enabled_ ? QpcMicroseconds() : 0) {}
+        : type_(type), enabled_(g_profileClients.load(std::memory_order_relaxed) > 0),
+          started_(enabled_ ? detail::QpcMicroseconds() : 0) {}
 
     ~IpcTrace() {
         if (!enabled_) return;
@@ -42,7 +36,7 @@ public:
             g_semanticIpcProvider,
             "IpcRoundTrip",
             TraceLoggingUInt16(static_cast<std::uint16_t>(type_), "MessageType"),
-            TraceLoggingUInt64(QpcMicroseconds() - started_, "DurationMicroseconds"));
+            TraceLoggingUInt64(detail::QpcMicroseconds() - started_, "DurationMicroseconds"));
     }
 
 private:
