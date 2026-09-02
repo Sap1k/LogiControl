@@ -25,6 +25,27 @@ public sealed class HidContractTests
     }
 
     [Fact]
+    public void ExplicitReportIdIsRepresentedWithoutChangingCommandLayout()
+    {
+        var command = new LogitechCommand(0xF8, 0x01, 0, 0, 0, 0, 0);
+
+        byte[] report = HidOutputReportFormatter.FormatCommand(command, 3, 9);
+
+        Assert.Equal(new byte[] { 3, 0xF8, 0x01, 0, 0, 0, 0, 0, 0 }, report);
+    }
+
+    [Fact]
+    public void CalibrationUsesDescriptorLogicalBoundsIncludingNonzeroMinimum()
+    {
+        var calibration = new SteeringCalibrationTracker(100, 4_195);
+        calibration.Observe(100, TimeSpan.Zero);
+        calibration.Observe(2_500, TimeSpan.FromMilliseconds(100));
+        calibration.Observe(2_147, TimeSpan.FromMilliseconds(200));
+
+        Assert.True(calibration.IsComplete(TimeSpan.FromMilliseconds(600), TimeSpan.FromMilliseconds(350)));
+    }
+
+    [Fact]
     public void CalibrationRequiresMovementFollowedByStableCenter()
     {
         var calibration = new SteeringCalibrationTracker(0, 1023);

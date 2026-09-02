@@ -14,7 +14,7 @@ using CanUnloadNowFn = HRESULT(STDAPICALLTYPE*)();
 
 int wmain(int argc, wchar_t** argv) {
     if (argc < 2 || argc > 4) {
-        std::wcerr << L"usage: LogiControl.ComAbiSmoke <provider.dll> [DFGT HID path] [--open-only|--validate-effects|--hold]\n";
+        std::wcerr << L"usage: LogiControl.ComAbiSmoke <provider.dll> [classic-wheel HID path] [--open-only|--validate-effects|--hold]\n";
         return 2;
     }
 

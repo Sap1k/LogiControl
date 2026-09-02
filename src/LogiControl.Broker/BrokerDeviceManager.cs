@@ -45,7 +45,20 @@ public sealed class BrokerDeviceManager
     private readonly SwitchableForceFeedbackOutputSink output;
     private readonly BrokerDeviceManagerOptions options;
     private readonly bool profileEvents;
-    private readonly HashSet<string> attemptedConnections = new(StringComparer.OrdinalIgnoreCase);
+    private readonly SemaphoreSlim scanGate = new(1, 1);
+    private readonly object candidateGate = new();
+    private readonly HashSet<WheelDeviceId> attemptedConnections = [];
+    private readonly Dictionary<WheelDeviceId, PhysicalWheelRecord> physicalWheels = [];
+    private readonly Dictionary<WheelDeviceId, RuntimeSettings> settingsByIdentity = [];
+    private DiscoveredCandidate[] candidates = [];
+    private ulong nextDeviceId = 1;
+    private long selectionRevision;
+    private CancellationTokenSource? activeTransition;
+    private WheelDeviceId pinnedDeviceId;
+    private WheelDeviceId selectedDeviceId;
+    private WheelDeviceId attachedDeviceId;
+    private CoalescingHidOutputPump? attachedPump;
+    private ClassicWheelProtocol activeProtocol = ClassicWheelProtocol.Default;
     private string? attachedDevicePath;
     private int deviceReady;
 
@@ -76,6 +89,91 @@ public sealed class BrokerDeviceManager
     public string LastTransitionReason { get; private set; } = "initial";
 
     public bool IsDeviceReady => Volatile.Read(ref deviceReady) != 0 && output.IsAttached;
+
+    public bool IsAutomaticSelection
+    {
+        get
+        {
+            lock (candidateGate)
+            {
+                return pinnedDeviceId == WheelDeviceId.Automatic;
+            }
+        }
+    }
+
+    public IReadOnlyList<BrokerWheelCandidate> GetCandidates()
+    {
+        lock (candidateGate)
+        {
+            return candidates.Select(candidate => new BrokerWheelCandidate(
+                candidate.Id,
+                candidate.Identity.Definition.Model,
+                candidate.Identity.Definition.DisplayName,
+                candidate.Device.VersionNumber,
+                candidate.Device.ProductId,
+                candidate.Device.DevicePath,
+                candidate.Id == selectedDeviceId ? State : BrokerDeviceLifecycleState.Observed,
+                candidate.Id == selectedDeviceId,
+                candidate.Id == selectedDeviceId && IsDeviceReady)).ToArray();
+        }
+    }
+
+    public bool CanBindPath(string devicePath)
+    {
+        if (string.IsNullOrWhiteSpace(devicePath) || !IsDeviceReady)
+        {
+            return false;
+        }
+
+        lock (candidateGate)
+        {
+            return selectedDeviceId != WheelDeviceId.Automatic &&
+                string.Equals(attachedDevicePath, devicePath, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    public async Task<bool> SelectAsync(
+        WheelDeviceId deviceId,
+        CancellationToken cancellationToken = default)
+    {
+        bool changesSelection;
+        CancellationTokenSource? superseded = null;
+        lock (candidateGate)
+        {
+            if (deviceId != WheelDeviceId.Automatic && candidates.All(candidate => candidate.Id != deviceId))
+            {
+                return false;
+            }
+
+            changesSelection = pinnedDeviceId != deviceId ||
+                deviceId != WheelDeviceId.Automatic && selectedDeviceId != deviceId;
+            pinnedDeviceId = deviceId;
+            if (changesSelection)
+            {
+                selectionRevision++;
+                Volatile.Write(ref deviceReady, 0);
+                superseded = activeTransition;
+            }
+        }
+
+        superseded?.Cancel();
+        await scanGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (changesSelection)
+            {
+                await DetachCurrentAsync("selection-changed").ConfigureAwait(false);
+            }
+
+            await RunScanTransitionAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            scanGate.Release();
+        }
+
+        return true;
+    }
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
@@ -118,75 +216,200 @@ public sealed class BrokerDeviceManager
 
     public async Task ScanOnceAsync(CancellationToken cancellationToken = default)
     {
-        IReadOnlyList<HidDeviceSnapshot> all = await enumerator.EnumerateAsync(cancellationToken).ConfigureAwait(false);
+        await scanGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await RunScanTransitionAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            scanGate.Release();
+        }
+    }
+
+    public BrokerResult SetRuntimeSettings(RuntimeSettings settings)
+    {
+        if (!EffectDefinitionValidator.TryValidate(settings, out _))
+        {
+            return BrokerResult.InvalidArgument;
+        }
+
+        lock (candidateGate)
+        {
+            DiscoveredCandidate? selected = candidates.FirstOrDefault(candidate => candidate.Id == selectedDeviceId);
+            if (selected is not null && !selected.Identity.Definition.SteeringRange.Supports(settings.RangeDegrees))
+            {
+                return BrokerResult.InvalidArgument;
+            }
+
+            BrokerResult result = coordinator.SetRuntimeSettings(settings);
+            if (result != BrokerResult.Ok)
+            {
+                return result;
+            }
+
+            if (selected is not null)
+            {
+                settingsByIdentity[selected.Id] = settings;
+                if (selected.Id == attachedDeviceId && IsDeviceReady)
+                {
+                    foreach (byte[] report in activeProtocol.CreateRangeReports(settings.RangeDegrees))
+                    {
+                        output.PublishBarrier(report);
+                    }
+                }
+            }
+
+            return BrokerResult.Ok;
+        }
+    }
+
+    private async Task RunScanTransitionAsync(CancellationToken cancellationToken)
+    {
+        using TransitionLease transition = BeginTransition(cancellationToken);
+        try
+        {
+            await ScanOnceCoreAsync(transition).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (transition.IsSuperseded)
+        {
+        }
+        finally
+        {
+            lock (candidateGate)
+            {
+                if (ReferenceEquals(activeTransition, transition.Source))
+                {
+                    activeTransition = null;
+                }
+            }
+        }
+    }
+
+    private TransitionLease BeginTransition(CancellationToken cancellationToken)
+    {
+        lock (candidateGate)
+        {
+            var source = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            activeTransition = source;
+            return new TransitionLease(this, selectionRevision, source);
+        }
+    }
+
+    private async Task ScanOnceCoreAsync(TransitionLease transition)
+    {
+        transition.ThrowIfInvalid();
+        IReadOnlyList<HidDeviceSnapshot> all = await enumerator.EnumerateAsync(transition.Token).ConfigureAwait(false);
+        transition.ThrowIfInvalid();
         HidDeviceSnapshot[] logitechJoysticks = all
             .Where(static device => device.VendorId == ClassicWheelCatalog.LogitechVendorId && device.IsJoystick)
             .ToArray();
-        HidDeviceSnapshot[] nativeDfgt = logitechJoysticks.Where(IsNativeDfgt).ToArray();
-        if (nativeDfgt.Length > 1)
+        LogUnknownCompatibilityPresentations(logitechJoysticks);
+        DiscoveredCandidate[] discovered = CreatePhysicalCandidates(logitechJoysticks);
+        WheelDeviceId pin;
+        lock (candidateGate)
         {
-            await FaultAndDetachAsync("ambiguous-native-device-selection").ConfigureAwait(false);
+            candidates = discovered;
+            attemptedConnections.IntersectWith(discovered.Select(static candidate => candidate.Id));
+            pin = pinnedDeviceId;
+        }
+
+        DiscoveredCandidate? selected = pin == WheelDeviceId.Automatic
+            ? discovered.Length == 1 ? discovered[0] : null
+            : discovered.FirstOrDefault(candidate => candidate.Id == pin);
+        if (selected is null)
+        {
+            lock (candidateGate)
+            {
+                selectedDeviceId = pin == WheelDeviceId.Automatic ? WheelDeviceId.Automatic : pin;
+            }
+
+            await DetachCurrentAsync(discovered.Length > 1 && pin == WheelDeviceId.Automatic
+                ? "selection-required"
+                : pin != WheelDeviceId.Automatic ? "selected-device-absent" : "device-absent").ConfigureAwait(false);
+            if (discovered.Length == 0 || pin != WheelDeviceId.Automatic)
+            {
+                if (discovered.Length == 0)
+                {
+                    attemptedConnections.Clear();
+                }
+
+                SetState(BrokerDeviceLifecycleState.Absent,
+                    pin == WheelDeviceId.Automatic ? "no-supported-wheel" : "selected-device-absent");
+            }
+            else
+            {
+                SetState(BrokerDeviceLifecycleState.Observed, "selection-required");
+            }
+
             return;
         }
 
-        if (nativeDfgt.Length == 1)
+        if (selected.IsAmbiguous)
         {
-            HidDeviceSnapshot native = nativeDfgt[0];
+            await DetachCurrentAsync("ambiguous-physical-correlation").ConfigureAwait(false);
+            SetState(BrokerDeviceLifecycleState.Observed, "ambiguous-physical-correlation");
+            return;
+        }
+
+        lock (candidateGate)
+        {
+            selectedDeviceId = selected.Id;
+        }
+
+        if (attachedDeviceId != WheelDeviceId.Automatic && attachedDeviceId != selected.Id)
+        {
+            await DetachCurrentAsync("selection-changed").ConfigureAwait(false);
+        }
+
+        HidDeviceSnapshot selectedDevice = selected.Device;
+        WheelIdentity selectedIdentity = selected.Identity;
+        if (selectedIdentity.IsPreferredMode)
+        {
+            HidDeviceSnapshot native = selectedDevice;
             if (IsDeviceReady && string.Equals(attachedDevicePath, native.DevicePath, StringComparison.OrdinalIgnoreCase))
             {
                 return;
             }
 
-            await AttachNativeDeviceAsync(native, "already-native", false, cancellationToken).ConfigureAwait(false);
+            await AttachNativeDeviceAsync(
+                native, selectedIdentity, selected.Id,
+                "already-preferred", false, transition).ConfigureAwait(false);
             return;
         }
 
-        HidDeviceSnapshot[] compatibleDfgt = logitechJoysticks.Where(IsCompatibleDfgt).ToArray();
-        if (compatibleDfgt.Length == 0)
-        {
-            await DetachCurrentAsync("device-absent").ConfigureAwait(false);
-            attemptedConnections.Clear();
-            SetState(BrokerDeviceLifecycleState.Absent, "no-supported-dfgt");
-            return;
-        }
-
-        if (compatibleDfgt.Length != 1)
-        {
-            await FaultAndDetachAsync("ambiguous-compatibility-device-selection").ConfigureAwait(false);
-            return;
-        }
-
-        HidDeviceSnapshot source = compatibleDfgt[0];
+        HidDeviceSnapshot source = selectedDevice;
         SetState(BrokerDeviceLifecycleState.Observed, "compatibility-device-observed");
-        SetState(BrokerDeviceLifecycleState.Identified, "revision-identified-dfgt");
-        string connectionKey = ConnectionKey(source);
-        if (!attemptedConnections.Add(connectionKey))
+        SetState(BrokerDeviceLifecycleState.Identified, "revision-identified-classic-wheel");
+        if (!attemptedConnections.Add(selected.Id))
         {
             return;
         }
 
-        await SwitchAndAttachAsync(source, cancellationToken).ConfigureAwait(false);
+        await SwitchAndAttachAsync(
+            source, selectedIdentity, selected.Id, transition).ConfigureAwait(false);
     }
 
-    private async Task SwitchAndAttachAsync(HidDeviceSnapshot source, CancellationToken cancellationToken)
+    private async Task SwitchAndAttachAsync(
+        HidDeviceSnapshot source,
+        WheelIdentity identity,
+        WheelDeviceId deviceId,
+        TransitionLease transition)
     {
-        if (!ClassicWheelCatalog.TryIdentify(
-                source.VendorId, source.ProductId, source.VersionNumber, out WheelIdentity? identity) || identity is null)
+        transition.ThrowIfInvalid();
+        IReadOnlyList<ModeSwitchStep> steps = identity.Definition.PreferredModeSwitch.Steps;
+        if (source.OutputReportByteLength != identity.Presentation.ReportLayout.OutputReportByteLength)
         {
+            SetState(BrokerDeviceLifecycleState.Faulted, "unexpected-presentation-output-report-length");
             return;
-        }
-
-        IReadOnlyList<LogitechCommand> commands = identity.Definition.NativeModeSwitchSequence;
-        if (commands.Count != 2)
-        {
-            throw new InvalidOperationException("The DFGT native-mode sequence must contain exactly two commands.");
         }
 
         SetState(BrokerDeviceLifecycleState.Calibrating, "waiting-for-power-on-calibration");
         try
         {
             _ = await calibrationMonitor.WaitForCompletionAsync(
-                source, options.CalibrationTimeout, cancellationToken).ConfigureAwait(false);
+                source, options.CalibrationTimeout, transition.Token).ConfigureAwait(false);
+            transition.ThrowIfInvalid();
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
@@ -194,36 +417,49 @@ public sealed class BrokerDeviceManager
             return;
         }
 
-        byte[][] reports = commands
-            .Select(command => HidOutputReportFormatter.FormatUnnumberedCommand(command, source.OutputReportByteLength))
+        byte[][] reports = steps
+            .Select(step => HidOutputReportFormatter.FormatCommand(
+                step.Command, step.ReportId, source.OutputReportByteLength))
             .ToArray();
-        SetState(BrokerDeviceLifecycleState.Switching, "sending-native-mode-sequence");
+        SetState(BrokerDeviceLifecycleState.Switching, "sending-preferred-mode-sequence");
+        transition.ThrowIfInvalid();
         await using (IHidTransport transport = transportFactory.OpenForOutput(source))
         {
-            await transport.SetOutputReportAsync(reports[0], cancellationToken).ConfigureAwait(false);
-            try
+            for (int index = 0; index < reports.Length; index++)
             {
-                await transport.SetOutputReportAsync(reports[1], cancellationToken).ConfigureAwait(false);
-            }
-            catch (Win32Exception exception) when (IsExpectedDetachError(exception.NativeErrorCode))
-            {
+                transition.ThrowIfInvalid();
+                try
+                {
+                    await transport.SetOutputReportAsync(reports[index], transition.Token).ConfigureAwait(false);
+                }
+                catch (Win32Exception exception) when (
+                    steps[index].DetachExpected && IsExpectedDetachError(exception.NativeErrorCode))
+                {
+                }
             }
         }
 
-        SetState(BrokerDeviceLifecycleState.AwaitingNativeMode, "waiting-for-c29a");
+        SetState(BrokerDeviceLifecycleState.AwaitingNativeMode, $"waiting-for-{identity.Definition.PreferredProductId:X4}");
         long started = Environment.TickCount64;
         while (TimeSpan.FromMilliseconds(Environment.TickCount64 - started) < options.NativeModeTimeout)
         {
-            await Task.Delay(options.RescanDebounce, cancellationToken).ConfigureAwait(false);
-            IReadOnlyList<HidDeviceSnapshot> devices = await enumerator.EnumerateAsync(cancellationToken).ConfigureAwait(false);
+            await Task.Delay(options.RescanDebounce, transition.Token).ConfigureAwait(false);
+            transition.ThrowIfInvalid();
+            IReadOnlyList<HidDeviceSnapshot> devices = await enumerator.EnumerateAsync(transition.Token).ConfigureAwait(false);
+            transition.ThrowIfInvalid();
             HidDeviceSnapshot[] candidates = devices
-                .Where(IsNativeDfgt)
+                .Where(device => IsPreferredPresentationOf(device, identity.Definition))
                 .Where(device => Correlates(source, device))
                 .ToArray();
             if (candidates.Length == 1)
             {
+                ObservePresentation(deviceId, candidates[0]);
                 await AttachNativeDeviceAsync(
-                    candidates[0], CorrelationMethod(source, candidates[0]), true, cancellationToken).ConfigureAwait(false);
+                    candidates[0],
+                    new WheelIdentity(identity.Definition, identity.Definition.PreferredPresentation,
+                        candidates[0].VendorId, candidates[0].VersionNumber),
+                    deviceId,
+                    CorrelationMethod(source, candidates[0]), true, transition).ConfigureAwait(false);
                 return;
             }
 
@@ -239,13 +475,18 @@ public sealed class BrokerDeviceManager
 
     private async Task AttachNativeDeviceAsync(
         HidDeviceSnapshot device,
+        WheelIdentity identity,
+        WheelDeviceId deviceId,
         string correlation,
         bool settleAfterNativeSwitch,
-        CancellationToken cancellationToken)
+        TransitionLease transition)
     {
+        transition.ThrowIfInvalid();
         Volatile.Write(ref deviceReady, 0);
         SetState(BrokerDeviceLifecycleState.NativeModeReady, correlation);
-        if (device.OutputReportByteLength != DfgtForceFeedbackReports.ReportLength)
+        var protocol = new ClassicWheelProtocol(identity.Definition);
+        if (device.OutputReportByteLength != protocol.ReportLength ||
+            device.OutputReportByteLength != identity.Presentation.ReportLayout.OutputReportByteLength)
         {
             SetState(BrokerDeviceLifecycleState.Faulted, "unexpected-native-output-report-length");
             return;
@@ -253,102 +494,250 @@ public sealed class BrokerDeviceManager
 
         if (settleAfterNativeSwitch)
         {
-            await Task.Delay(options.NativeModeSettleDelay, cancellationToken).ConfigureAwait(false);
+            await Task.Delay(options.NativeModeSettleDelay, transition.Token).ConfigureAwait(false);
+            transition.ThrowIfInvalid();
         }
 
         await DetachCurrentAsync("replace-device").ConfigureAwait(false);
+        transition.ThrowIfInvalid();
         IHidTransport? transport = null;
         CoalescingHidOutputPump? pump = null;
+        bool pumpAttached = false;
         try
         {
+            RuntimeSettings remembered;
+            lock (candidateGate)
+            {
+                remembered = settingsByIdentity.GetValueOrDefault(deviceId, RuntimeSettings.Default);
+            }
+
+            if (!protocol.IsRangeSupported(remembered.RangeDegrees))
+            {
+                SetState(BrokerDeviceLifecycleState.Faulted, "remembered-steering-range-unsupported");
+                return;
+            }
+
+            transition.ThrowIfInvalid();
+            runtime.Invoke(
+                () => _ = coordinator.SetRuntimeSettings(remembered),
+                options.OutputReadyTimeout);
+            transition.ThrowIfInvalid();
             transport = transportFactory.OpenForOutput(device);
-            await InitializeNativeOutputAsync(transport, cancellationToken).ConfigureAwait(false);
-            pump = new CoalescingHidOutputPump(transport, profileEvents: profileEvents);
+            await InitializeNativeOutputAsync(transport, protocol, transition).ConfigureAwait(false);
+            transition.ThrowIfInvalid();
+            pump = new CoalescingHidOutputPump(transport, profileEvents: profileEvents, protocol: protocol);
             transport = null;
+            transition.ThrowIfInvalid();
             runtime.Invoke(() =>
             {
+                transition.ThrowIfInvalid();
                 output.Attach(pump);
-                runtime.ResetOutputPolicyForAttach();
+                pumpAttached = true;
+                runtime.ResetOutputPolicyForAttach(protocol);
             }, options.OutputReadyTimeout);
 
             RuntimeSettings settings = coordinator.RuntimeSettings;
-            var finalAutocenter = new byte[DfgtForceFeedbackReports.ReportLength];
+            var finalAutocenter = new byte[protocol.ReportLength];
             if (settings.IdleAutocenter > 0)
             {
-                DfgtForceFeedbackReports.WriteEnableAutocenter(finalAutocenter);
+                protocol.WriteEnableAutocenter(finalAutocenter);
             }
             else
             {
-                DfgtForceFeedbackReports.WriteDisableAutocenter(finalAutocenter);
+                protocol.WriteDisableAutocenter(finalAutocenter);
             }
 
             using var readyTimeout = new CancellationTokenSource(options.OutputReadyTimeout);
             using var readyLinked = CancellationTokenSource.CreateLinkedTokenSource(
-                cancellationToken, readyTimeout.Token);
+                transition.Token, readyTimeout.Token);
+            transition.ThrowIfInvalid();
             await pump.PublishBarrierAndWaitAsync(finalAutocenter, readyLinked.Token).ConfigureAwait(false);
+            transition.ThrowIfInvalid();
             attachedDevicePath = device.DevicePath;
+            attachedDeviceId = deviceId;
+            activeProtocol = protocol;
+            lock (candidateGate)
+            {
+                int index = Array.FindIndex(candidates, candidate => candidate.Id == deviceId);
+                if (index >= 0)
+                {
+                    candidates[index] = new DiscoveredCandidate(deviceId, device, identity, false);
+                }
+            }
+
+            transition.ThrowIfInvalid();
+            Volatile.Write(ref attachedPump, pump);
             Volatile.Write(ref deviceReady, 1);
             SetState(BrokerDeviceLifecycleState.Attached, "managed-broker-output-ready");
         }
-        catch (Exception exception) when (exception is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (transition.IsSuperseded)
         {
-            Volatile.Write(ref deviceReady, 0);
-            CoalescingHidOutputPump? attached = runtime.Invoke(() => output.Detach(), options.OutputReadyTimeout);
-            (attached ?? pump)?.Dispose();
+            await CleanupPartialAttachAsync(pump, pumpAttached, protocol).ConfigureAwait(false);
+            throw;
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            await CleanupPartialAttachAsync(pump, pumpAttached, protocol).ConfigureAwait(false);
             SetState(BrokerDeviceLifecycleState.Faulted, $"broker-attach-failed:{exception.GetType().Name}");
+        }
+        catch (OperationCanceledException)
+        {
+            await CleanupPartialAttachAsync(pump, pumpAttached, protocol).ConfigureAwait(false);
+            throw;
         }
         finally
         {
             if (transport is not null)
             {
+                var stopAll = new byte[protocol.ReportLength];
+                protocol.WriteStopAll(stopAll);
+                try
+                {
+                    using var timeout = new CancellationTokenSource(options.OutputReadyTimeout);
+                    await transport.WriteOutputReportAsync(stopAll, timeout.Token).ConfigureAwait(false);
+                }
+                catch (Exception exception) when (exception is IOException or TimeoutException or OperationCanceledException or ObjectDisposedException)
+                {
+                }
+
                 await transport.DisposeAsync().ConfigureAwait(false);
             }
         }
     }
 
-    private async Task InitializeNativeOutputAsync(IHidTransport transport, CancellationToken cancellationToken)
+    private async Task InitializeNativeOutputAsync(
+        IHidTransport transport,
+        ClassicWheelProtocol protocol,
+        TransitionLease transition)
     {
         RuntimeSettings settings = coordinator.RuntimeSettings;
-        var report = new byte[DfgtForceFeedbackReports.ReportLength];
-        DfgtForceFeedbackReports.WriteStopAll(report);
-        await transport.WriteOutputReportAsync(report, cancellationToken).ConfigureAwait(false);
-        DfgtForceFeedbackReports.WriteDisableAutocenter(report);
-        await transport.WriteOutputReportAsync(report, cancellationToken).ConfigureAwait(false);
-        DfgtForceFeedbackReports.WriteRange(report, settings.RangeDegrees);
-        await transport.WriteOutputReportAsync(report, cancellationToken).ConfigureAwait(false);
-        DfgtForceFeedbackReports.WriteAutocenterParameters(report, settings.IdleAutocenter);
-        await transport.WriteOutputReportAsync(report, cancellationToken).ConfigureAwait(false);
+        var report = new byte[protocol.ReportLength];
+        protocol.WriteStopAll(report);
+        transition.ThrowIfInvalid();
+        await transport.WriteOutputReportAsync(report, transition.Token).ConfigureAwait(false);
+        protocol.WriteDisableAutocenter(report);
+        transition.ThrowIfInvalid();
+        await transport.WriteOutputReportAsync(report, transition.Token).ConfigureAwait(false);
+        foreach (byte[] range in protocol.CreateRangeReports(settings.RangeDegrees))
+        {
+            transition.ThrowIfInvalid();
+            await transport.WriteOutputReportAsync(range, transition.Token).ConfigureAwait(false);
+        }
+
+        protocol.WriteAutocenterParameters(report, settings.IdleAutocenter);
+        transition.ThrowIfInvalid();
+        await transport.WriteOutputReportAsync(report, transition.Token).ConfigureAwait(false);
+    }
+
+    private async Task CleanupPartialAttachAsync(
+        CoalescingHidOutputPump? pump,
+        bool pumpAttached,
+        ClassicWheelProtocol protocol)
+    {
+        Volatile.Write(ref deviceReady, 0);
+        CoalescingHidOutputPump? owned = pump;
+        if (pumpAttached)
+        {
+            try
+            {
+                owned = runtime.Invoke(() => output.Detach(), options.OutputReadyTimeout) ?? pump;
+            }
+            catch (TimeoutException)
+            {
+                owned = output.Detach() ?? pump;
+            }
+        }
+
+        if (owned is null)
+        {
+            return;
+        }
+
+        var stopAll = new byte[protocol.ReportLength];
+        protocol.WriteStopAll(stopAll);
+        try
+        {
+            using var timeout = new CancellationTokenSource(options.OutputReadyTimeout);
+            await owned.PublishBarrierAndWaitAsync(stopAll, timeout.Token).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is IOException or TimeoutException or OperationCanceledException or ObjectDisposedException)
+        {
+        }
+        finally
+        {
+            owned.Dispose();
+        }
     }
 
     private async Task HandleOutputFaultAsync(CoalescingHidOutputPump failedPump)
     {
-        Volatile.Write(ref deviceReady, 0);
-        attachedDevicePath = null;
+        await scanGate.WaitAsync().ConfigureAwait(false);
         try
         {
-            runtime.Invoke(coordinator.DeviceRemoved, options.OutputReadyTimeout);
-        }
-        catch (TimeoutException)
-        {
-        }
+            if (!ReferenceEquals(Volatile.Read(ref attachedPump), failedPump))
+            {
+                failedPump.Dispose();
+                return;
+            }
 
-        failedPump.Dispose();
-        SetState(BrokerDeviceLifecycleState.Faulted, "continuous-output-fault");
-        await Task.CompletedTask;
+            Volatile.Write(ref attachedPump, null);
+            Volatile.Write(ref deviceReady, 0);
+            WheelDeviceId failedDeviceId = attachedDeviceId;
+            attachedDevicePath = null;
+            attachedDeviceId = WheelDeviceId.Automatic;
+            try
+            {
+                runtime.Invoke(() =>
+                {
+                    if (failedDeviceId != WheelDeviceId.Automatic)
+                    {
+                        lock (candidateGate)
+                        {
+                            settingsByIdentity[failedDeviceId] = coordinator.RuntimeSettings;
+                        }
+                    }
+
+                    coordinator.DeviceRemoved();
+                }, options.OutputReadyTimeout);
+            }
+            catch (TimeoutException)
+            {
+            }
+
+            failedPump.Dispose();
+            SetState(BrokerDeviceLifecycleState.Faulted, "continuous-output-fault");
+        }
+        finally
+        {
+            scanGate.Release();
+        }
     }
 
     private async Task DetachCurrentAsync(string reason)
     {
         Volatile.Write(ref deviceReady, 0);
-        if (!output.IsAttached)
+        CoalescingHidOutputPump? logicalPump = Volatile.Read(ref attachedPump);
+        if (!output.IsAttached && logicalPump is null)
         {
             attachedDevicePath = null;
+            attachedDeviceId = WheelDeviceId.Automatic;
             return;
         }
 
         try
         {
-            runtime.Invoke(coordinator.DeviceRemoved, options.OutputReadyTimeout);
+            runtime.Invoke(() =>
+            {
+                if (attachedDeviceId != WheelDeviceId.Automatic)
+                {
+                    lock (candidateGate)
+                    {
+                        settingsByIdentity[attachedDeviceId] = coordinator.RuntimeSettings;
+                    }
+                }
+
+                coordinator.DeviceRemoved();
+            }, options.OutputReadyTimeout);
         }
         catch (TimeoutException)
         {
@@ -357,23 +746,28 @@ public sealed class BrokerDeviceManager
         CoalescingHidOutputPump? pump;
         try
         {
-            pump = runtime.Invoke(() => output.Detach(), options.OutputReadyTimeout);
+            pump = runtime.Invoke(() => output.Detach(), options.OutputReadyTimeout) ?? logicalPump;
         }
         catch (TimeoutException)
         {
-            pump = output.Detach();
+            pump = output.Detach() ?? logicalPump;
         }
+
+        Interlocked.CompareExchange(ref attachedPump, null, logicalPump);
 
         if (pump is not null)
         {
-            var stopAll = new byte[DfgtForceFeedbackReports.ReportLength];
-            DfgtForceFeedbackReports.WriteStopAll(stopAll);
             try
             {
-                using var timeout = new CancellationTokenSource(options.OutputReadyTimeout);
-                await pump.PublishBarrierAndWaitAsync(stopAll, timeout.Token).ConfigureAwait(false);
+                if (pump.Failure is null)
+                {
+                    var stopAll = new byte[activeProtocol.ReportLength];
+                    activeProtocol.WriteStopAll(stopAll);
+                    using var timeout = new CancellationTokenSource(options.OutputReadyTimeout);
+                    await pump.PublishBarrierAndWaitAsync(stopAll, timeout.Token).ConfigureAwait(false);
+                }
             }
-            catch (Exception exception) when (exception is IOException or TimeoutException or OperationCanceledException)
+            catch (Exception exception) when (exception is IOException or TimeoutException or OperationCanceledException or ObjectDisposedException)
             {
             }
             finally
@@ -383,6 +777,7 @@ public sealed class BrokerDeviceManager
         }
 
         attachedDevicePath = null;
+        attachedDeviceId = WheelDeviceId.Automatic;
         LastTransitionReason = reason;
     }
 
@@ -403,15 +798,10 @@ public sealed class BrokerDeviceManager
         }
     }
 
-    private static bool IsNativeDfgt(HidDeviceSnapshot device) =>
-        device.ProductId == 0xC29A &&
-        ClassicWheelCatalog.TryIdentify(device.VendorId, device.ProductId, device.VersionNumber, out WheelIdentity? identity) &&
-        identity?.Definition.Model == WheelModel.DrivingForceGT;
-
-    private static bool IsCompatibleDfgt(HidDeviceSnapshot device) =>
-        device.ProductId == ClassicWheelCatalog.CompatibilityProductId &&
-        ClassicWheelCatalog.TryIdentify(device.VendorId, device.ProductId, device.VersionNumber, out WheelIdentity? identity) &&
-        identity?.Definition.Model == WheelModel.DrivingForceGT;
+    private static bool IsPreferredPresentationOf(HidDeviceSnapshot device, WheelDefinition definition) =>
+        device.VendorId == ClassicWheelCatalog.LogitechVendorId &&
+        device.ProductId == definition.PreferredProductId &&
+        definition.MatchesRevision(device.VersionNumber);
 
     private static bool Correlates(HidDeviceSnapshot source, HidDeviceSnapshot candidate) =>
         source.ContainerId is not null && candidate.ContainerId == source.ContainerId ||
@@ -420,8 +810,256 @@ public sealed class BrokerDeviceManager
     private static string CorrelationMethod(HidDeviceSnapshot source, HidDeviceSnapshot candidate) =>
         source.ContainerId is not null && candidate.ContainerId == source.ContainerId ? "container-id" : "location-path";
 
-    private static string ConnectionKey(HidDeviceSnapshot device) =>
-        device.ContainerId?.ToString("D") ?? device.EffectiveLocationPaths.FirstOrDefault() ?? device.InstanceId;
+    private void LogUnknownCompatibilityPresentations(IEnumerable<HidDeviceSnapshot> devices)
+    {
+        foreach (HidDeviceSnapshot device in devices.Where(static device =>
+                     device.ProductId == ClassicWheelCatalog.CompatibilityProductId &&
+                     !ClassicWheelCatalog.TryIdentify(
+                         device.VendorId, device.ProductId, device.VersionNumber, out _)))
+        {
+            BrokerEventSource.Log.ReadOnlyPresentation(
+                device.ProductId.ToString("X4", System.Globalization.CultureInfo.InvariantCulture),
+                device.VersionNumber.ToString("X4", System.Globalization.CultureInfo.InvariantCulture),
+                "unknown-c294-revision");
+        }
+    }
+
+    private DiscoveredCandidate[] CreatePhysicalCandidates(IEnumerable<HidDeviceSnapshot> devices)
+    {
+        var presentations = new List<PresentationCandidate>();
+        foreach (HidDeviceSnapshot device in devices)
+        {
+            if (ClassicWheelCatalog.TryIdentify(
+                    device.VendorId, device.ProductId, device.VersionNumber, out WheelIdentity? identity) &&
+                identity is not null)
+            {
+                presentations.Add(new PresentationCandidate(device, identity));
+            }
+        }
+
+        var groups = new List<List<PresentationCandidate>>();
+        foreach (PresentationCandidate presentation in presentations)
+        {
+            int[] matches = groups
+                .Select((group, index) => (group, index))
+                .Where(value => value.group.Any(existing => SamePhysicalEvidence(existing.Device, presentation.Device)))
+                .Select(static value => value.index)
+                .ToArray();
+            if (matches.Length == 0)
+            {
+                groups.Add([presentation]);
+                continue;
+            }
+
+            List<PresentationCandidate> target = groups[matches[0]];
+            target.Add(presentation);
+            for (int index = matches.Length - 1; index > 0; index--)
+            {
+                target.AddRange(groups[matches[index]]);
+                groups.RemoveAt(matches[index]);
+            }
+        }
+
+        lock (candidateGate)
+        {
+            var discovered = new List<DiscoveredCandidate>(groups.Count);
+            foreach (List<PresentationCandidate> group in groups)
+            {
+                PresentationCandidate first = group[0];
+                PhysicalWheelRecord[] registryMatches = physicalWheels.Values
+                    .Where(record => group.Any(presentation => record.Matches(presentation)))
+                    .ToArray();
+                bool ambiguous = registryMatches.Length > 1;
+                PhysicalWheelRecord record;
+                if (registryMatches.Length == 0)
+                {
+                    var id = new WheelDeviceId(nextDeviceId++);
+                    record = new PhysicalWheelRecord(id, first.Identity.Definition.Model, first.Device.VersionNumber);
+                    physicalWheels.Add(id, record);
+                }
+                else
+                {
+                    record = registryMatches.OrderBy(static value => value.Id.Value).First();
+                }
+
+                if (!ambiguous)
+                {
+                    foreach (PresentationCandidate presentation in group)
+                    {
+                        record.Absorb(presentation.Device);
+                    }
+                }
+
+                (PresentationCandidate representative, bool endpointAmbiguous) =
+                    SelectRepresentative(group, attachedDevicePath);
+                discovered.Add(new DiscoveredCandidate(
+                    record.Id,
+                    representative.Device,
+                    representative.Identity,
+                    ambiguous || endpointAmbiguous));
+            }
+
+            return discovered
+                .OrderBy(static candidate => candidate.Id.Value)
+                .Take(ClassicWheelCatalog.MaximumCandidates)
+                .ToArray();
+        }
+    }
+
+    private void ObservePresentation(WheelDeviceId id, HidDeviceSnapshot device)
+    {
+        lock (candidateGate)
+        {
+            if (physicalWheels.TryGetValue(id, out PhysicalWheelRecord? record))
+            {
+                record.Absorb(device);
+            }
+        }
+    }
+
+    private static (PresentationCandidate Representative, bool Ambiguous) SelectRepresentative(
+        IReadOnlyList<PresentationCandidate> group,
+        string? attachedPath)
+    {
+        int bestRank = group.Max(PresentationRank);
+        PresentationCandidate[] best = group.Where(value => PresentationRank(value) == bestRank).ToArray();
+        if (best.Length == 1)
+        {
+            return (best[0], false);
+        }
+
+        PresentationCandidate[] attached = best.Where(value => string.Equals(
+            value.Device.DevicePath, attachedPath, StringComparison.OrdinalIgnoreCase)).ToArray();
+        return attached.Length == 1 ? (attached[0], false) : (best[0], true);
+    }
+
+    private static int PresentationRank(PresentationCandidate presentation)
+    {
+        IReadOnlyList<WheelPresentationDefinition> definitions = presentation.Identity.Definition.Presentations;
+        for (int index = 0; index < definitions.Count; index++)
+        {
+            if (definitions[index].ProductId == presentation.Device.ProductId)
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
+
+    private static bool SamePhysicalEvidence(HidDeviceSnapshot left, HidDeviceSnapshot right)
+    {
+        if (left.VersionNumber != right.VersionNumber ||
+            !ClassicWheelCatalog.TryIdentify(left.VendorId, left.ProductId, left.VersionNumber, out WheelIdentity? leftIdentity) ||
+            !ClassicWheelCatalog.TryIdentify(right.VendorId, right.ProductId, right.VersionNumber, out WheelIdentity? rightIdentity) ||
+            leftIdentity?.Definition.Model != rightIdentity?.Definition.Model)
+        {
+            return false;
+        }
+
+        if (left.ContainerId is not null && left.ContainerId == right.ContainerId ||
+            left.EffectiveLocationPaths.Intersect(right.EffectiveLocationPaths, StringComparer.OrdinalIgnoreCase).Any())
+        {
+            return true;
+        }
+
+        bool comparableStrongEvidence = left.ContainerId is not null && right.ContainerId is not null ||
+            left.EffectiveLocationPaths.Count > 0 && right.EffectiveLocationPaths.Count > 0;
+        if (comparableStrongEvidence)
+        {
+            return false;
+        }
+
+        return !string.IsNullOrWhiteSpace(left.ParentInstanceId) &&
+                string.Equals(left.ParentInstanceId, right.ParentInstanceId, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(left.InstanceId, right.InstanceId, StringComparison.OrdinalIgnoreCase);
+    }
 
     private static bool IsExpectedDetachError(int error) => error is 6 or 31 or 995 or 1167;
+
+    private sealed record PresentationCandidate(HidDeviceSnapshot Device, WheelIdentity Identity);
+
+    private sealed record DiscoveredCandidate(
+        WheelDeviceId Id,
+        HidDeviceSnapshot Device,
+        WheelIdentity Identity,
+        bool IsAmbiguous);
+
+    private sealed class PhysicalWheelRecord(WheelDeviceId id, WheelModel model, ushort revision)
+    {
+        private readonly HashSet<Guid> containerIds = [];
+        private readonly HashSet<string> locationPaths = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> parentInstanceIds = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> instanceIds = new(StringComparer.OrdinalIgnoreCase);
+
+        public WheelDeviceId Id { get; } = id;
+
+        public WheelModel Model { get; } = model;
+
+        public ushort Revision { get; } = revision;
+
+        public bool Matches(PresentationCandidate presentation)
+        {
+            HidDeviceSnapshot device = presentation.Device;
+            if (Model != presentation.Identity.Definition.Model || Revision != device.VersionNumber)
+            {
+                return false;
+            }
+
+            if (device.ContainerId is Guid containerId && containerIds.Contains(containerId) ||
+                device.EffectiveLocationPaths.Any(locationPaths.Contains))
+            {
+                return true;
+            }
+
+            bool comparableStrongEvidence = device.ContainerId is not null && containerIds.Count > 0 ||
+                device.EffectiveLocationPaths.Count > 0 && locationPaths.Count > 0;
+            if (comparableStrongEvidence)
+            {
+                return false;
+            }
+
+            return !string.IsNullOrWhiteSpace(device.ParentInstanceId) && parentInstanceIds.Contains(device.ParentInstanceId) ||
+                instanceIds.Contains(device.InstanceId);
+        }
+
+        public void Absorb(HidDeviceSnapshot device)
+        {
+            if (device.ContainerId is Guid containerId)
+            {
+                containerIds.Add(containerId);
+            }
+
+            locationPaths.UnionWith(device.EffectiveLocationPaths);
+            if (!string.IsNullOrWhiteSpace(device.ParentInstanceId))
+            {
+                parentInstanceIds.Add(device.ParentInstanceId);
+            }
+
+            instanceIds.Add(device.InstanceId);
+        }
+    }
+
+    private sealed class TransitionLease(
+        BrokerDeviceManager owner,
+        long revision,
+        CancellationTokenSource source) : IDisposable
+    {
+        public CancellationTokenSource Source { get; } = source;
+
+        public CancellationToken Token => Source.Token;
+
+        public bool IsSuperseded => Volatile.Read(ref owner.selectionRevision) != revision;
+
+        public void ThrowIfInvalid()
+        {
+            Token.ThrowIfCancellationRequested();
+            if (IsSuperseded)
+            {
+                throw new OperationCanceledException(Token);
+            }
+        }
+
+        public void Dispose() => Source.Dispose();
+    }
 }

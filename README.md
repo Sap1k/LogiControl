@@ -9,11 +9,12 @@ kernel driver.
 
 ## Status
 
-The first DFGT vertical slice worked on physical hardware. Phase 2 now replaces
-that legacy path with the authoritative .NET broker, a 500 Hz effect engine,
-semantic IPC, and asynchronous HID output. The new path is automated-test-only
-until the next physical-wheel replay; the earlier x64 DirectInput and real-game
-results remain historical baseline evidence.
+The first DFGT vertical slice worked on physical hardware. Phases 2 and 3 now
+provide an authoritative .NET broker, a 500 Hz effect engine, semantic IPC,
+asynchronous HID output, and catalog-driven DFGT/G27/G25/Driving Force Pro
+definitions. Exactly one discovered wheel is managed at a time. The new path is
+automated-test-only until physical replay; earlier DFGT x64 DirectInput and
+real-game results remain historical baseline evidence.
 
 This is development evidence, not a general hardware-support claim.
 See [the implementation plan](docs/implementation-plan.md) and
@@ -62,6 +63,7 @@ Broker diagnostics (do not run hardware-serving mode without the wheel):
 ```powershell
 dotnet run --project .\src\LogiControl.Broker -c Release -- list --json
 dotnet run --project .\src\LogiControl.Broker -c Release -- status
+dotnet run --project .\src\LogiControl.Broker -c Release -- devices
 ```
 
 Development registration requires an elevated PowerShell and supports

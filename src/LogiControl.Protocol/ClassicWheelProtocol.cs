@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Protocol behavior independently expressed from new-lg4ff, commit
+// 2092db19f7b40854e0427a1b2e39eda9f8d0c3cd (GPL-2.0-or-later).
+// Condition scaling preserves behavior translated from DFGT Control,
+// commit 426d7007a1d40e4d2de5c5873959620f9066ec1c (MIT); see THIRD_PARTY_NOTICES.md.
 
 namespace LogiControl.Protocol;
 
@@ -9,55 +13,78 @@ public enum FirmwareSlotOperation : byte
     Update = 12,
 }
 
-public static class DfgtForceFeedbackReports
+/// <summary>
+/// Encodes reports for the shared Logitech classic four-slot force-feedback family.
+/// Model differences are represented by <see cref="WheelProtocolProfile"/> strategies.
+/// </summary>
+public sealed class ClassicWheelProtocol
 {
-    public const int ReportLength = 8;
+    private readonly WheelProtocolProfile profile;
+    private readonly SteeringRangeDefinition steeringRange;
 
-    public static void WriteStopAll(Span<byte> report)
+    public static ClassicWheelProtocol Default { get; } =
+        new(ClassicWheelCatalog.GetDefinition(WheelModel.DrivingForceGT));
+
+    public ClassicWheelProtocol(WheelDefinition definition)
+    {
+        ArgumentNullException.ThrowIfNull(definition);
+        profile = definition.ProtocolProfile;
+        steeringRange = definition.SteeringRange;
+        ValidateProfile();
+    }
+
+    public int ReportLength => profile.NativeReportLayout.OutputReportByteLength;
+
+    public bool IsRangeSupported(int degrees) => steeringRange.Supports(degrees);
+
+    public void WriteStopAll(Span<byte> report)
     {
         Prepare(report);
         report[1] = 0xF3;
     }
 
-    public static void WriteDisableAutocenter(Span<byte> report)
+    public void WriteDisableAutocenter(Span<byte> report)
     {
         Prepare(report);
         report[1] = 0xF5;
     }
 
-    public static void WriteEnableAutocenter(Span<byte> report)
+    public void WriteEnableAutocenter(Span<byte> report)
     {
         Prepare(report);
         report[1] = 0x14;
     }
 
-    public static void WriteSlotStop(Span<byte> report, int slot)
+    public void WriteSlotStop(Span<byte> report, int slot)
     {
         Prepare(report);
         report[1] = Command(slot, FirmwareSlotOperation.Stop);
     }
 
-    public static void WriteConstant(Span<byte> report, int slot, FirmwareSlotOperation operation, int magnitude)
+    public void WriteConstant(Span<byte> report, int slot, FirmwareSlotOperation operation, int magnitude)
     {
         Prepare(report);
         report[1] = Command(slot, operation);
-        report[2] = 0x08;
-        byte translated = TranslateSignedMagnitude(magnitude);
-        report[3] = translated;
-        report[4] = 0x80;
+        report[2] = 0x00;
+        report[3 + slot] = TranslateSignedMagnitude(magnitude);
     }
 
-    public static void WriteRange(Span<byte> report, int degrees)
+    public IReadOnlyList<byte[]> CreateRangeReports(int degrees)
     {
-        Prepare(report);
-        int clamped = Math.Clamp(degrees, 40, 900);
-        report[1] = 0xF8;
-        report[2] = 0x81;
-        report[3] = (byte)clamped;
-        report[4] = (byte)(clamped >> 8);
+        if (!IsRangeSupported(degrees))
+        {
+            throw new ArgumentOutOfRangeException(nameof(degrees), "The steering range is not supported by this wheel.");
+        }
+
+        return profile.SteeringRange switch
+        {
+            SteeringRangeStrategy.ExtendedCommand81 => [CreateExtendedRangeReport(degrees)],
+            SteeringRangeStrategy.DrivingForceProDiscrete => CreateDrivingForceProRangeReports(degrees),
+            _ => throw new NotSupportedException($"Unknown steering-range strategy: {profile.SteeringRange}."),
+        };
     }
 
-    public static void WriteSpring(
+    public void WriteSpring(
         Span<byte> report,
         int slot,
         FirmwareSlotOperation operation,
@@ -105,7 +132,7 @@ public static class DfgtForceFeedbackReports
         report[7] = ScaleSaturation(Math.Max(leftSaturation, rightSaturation));
     }
 
-    public static void WriteDamper(
+    public void WriteDamper(
         Span<byte> report,
         int slot,
         FirmwareSlotOperation operation,
@@ -128,7 +155,7 @@ public static class DfgtForceFeedbackReports
         report[7] = ScaleSaturation(Math.Max(leftSaturation, rightSaturation));
     }
 
-    public static void WriteFriction(
+    public void WriteFriction(
         Span<byte> report,
         int slot,
         FirmwareSlotOperation operation,
@@ -150,8 +177,44 @@ public static class DfgtForceFeedbackReports
         report[6] = (byte)((rightCoefficient < 0 ? 0x10 : 0) | (leftCoefficient < 0 ? 0x01 : 0));
     }
 
-    public static void WriteAutocenterParameters(Span<byte> report, int magnitude)
+    public void WriteCondition(
+        Span<byte> report,
+        int slot,
+        FirmwareSlotOperation operation,
+        ConditionEffectDefinition definition)
     {
+        ArgumentNullException.ThrowIfNull(definition);
+        switch (definition.Condition)
+        {
+            case ForceEffectKind.Spring:
+                WriteSpring(report, slot, operation, definition.Offset, definition.DeadBand,
+                    definition.NegativeCoefficient, definition.PositiveCoefficient,
+                    definition.NegativeSaturation, definition.PositiveSaturation);
+                break;
+            case ForceEffectKind.Friction when profile.SupportsNativeFriction:
+                WriteFriction(report, slot, operation, definition.Offset, definition.DeadBand,
+                    definition.NegativeCoefficient, definition.PositiveCoefficient,
+                    definition.NegativeSaturation, definition.PositiveSaturation);
+                break;
+            case ForceEffectKind.Damper:
+            case ForceEffectKind.Inertia:
+            case ForceEffectKind.Friction:
+                WriteDamper(report, slot, operation, definition.Offset, definition.DeadBand,
+                    definition.NegativeCoefficient, definition.PositiveCoefficient,
+                    definition.NegativeSaturation, definition.PositiveSaturation);
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(definition), "The effect is not a condition effect.");
+        }
+    }
+
+    public void WriteAutocenterParameters(Span<byte> report, int magnitude)
+    {
+        if (profile.Autocenter != AutocenterStrategy.Classic)
+        {
+            throw new NotSupportedException($"Unknown autocenter strategy: {profile.Autocenter}.");
+        }
+
         Prepare(report);
         uint scaled = (uint)Math.Clamp(magnitude, 0, 10_000) * 0xFFFFu / 10_000u;
         const uint knee = 0xAAAA;
@@ -176,14 +239,56 @@ public static class DfgtForceFeedbackReports
         report[5] = ClampByte(expandedB / knee);
     }
 
-    private static void Prepare(Span<byte> report)
+    private byte[] CreateExtendedRangeReport(int degrees)
+    {
+        var report = new byte[ReportLength];
+        Prepare(report);
+        report[1] = 0xF8;
+        report[2] = 0x81;
+        report[3] = (byte)degrees;
+        report[4] = (byte)(degrees >> 8);
+        return report;
+    }
+
+    private IReadOnlyList<byte[]> CreateDrivingForceProRangeReports(int degrees)
+    {
+        var coarse = new byte[ReportLength];
+        Prepare(coarse);
+        coarse[1] = 0xF8;
+        coarse[2] = degrees switch
+        {
+            200 => 0x02,
+            900 => 0x03,
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(degrees), "Driving Force Pro supports only 200 or 900 degrees."),
+        };
+
+        var fine = new byte[ReportLength];
+        Prepare(fine);
+        fine[1] = 0x81;
+        fine[2] = 0x0B;
+        return [coarse, fine];
+    }
+
+    private void Prepare(Span<byte> report)
     {
         if (report.Length < ReportLength)
         {
-            throw new ArgumentException("A DFGT force-feedback report is eight bytes.", nameof(report));
+            throw new ArgumentException($"The force-feedback report must be at least {ReportLength} bytes.", nameof(report));
         }
 
         report[..ReportLength].Clear();
+        report[0] = profile.NativeReportLayout.ReportId;
+    }
+
+    private void ValidateProfile()
+    {
+        profile.NativeReportLayout.Validate();
+        if (profile.ForceFeedbackFamily != ForceFeedbackProtocolFamily.LogitechClassicFourSlot ||
+            profile.NativeReportLayout.CommandPayloadLength != LogitechCommand.Length)
+        {
+            throw new NotSupportedException("Only the Logitech classic four-slot protocol is currently supported.");
+        }
     }
 
     private static byte Command(int slot, FirmwareSlotOperation operation)

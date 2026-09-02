@@ -65,7 +65,7 @@ public sealed class ManagedPathIntegrationTests
             Assert.Equal(BrokerResult.Ok, Result(dispatcher.Dispatch(
                 Request(IpcMessageType.StartEffect, 4, hello.Header.SessionId, start))));
             Assert.True(SpinWait.SpinUntil(
-                () => transport.WriteReports.Any(static report => report[2] == 0x08 && report[3] > 0x80),
+                () => transport.WriteReports.Any(static report => report[2] == 0x00 && report[3] > 0x80),
                 TimeSpan.FromSeconds(2)));
 
             enumerator.Devices = [];

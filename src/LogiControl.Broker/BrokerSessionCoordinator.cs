@@ -271,12 +271,6 @@ public sealed class BrokerSessionCoordinator : IRuntimeMixer
         return BrokerResult.Ok;
     }
 
-    public BrokerResult SetRuntimeSettings(ulong sessionId, RuntimeSettings settings)
-    {
-        int index = FindSession(sessionId);
-        return index < 0 ? BrokerResult.InputLost : Map(sessions[index]!.Engine.SetRuntimeSettings(settings));
-    }
-
     public BrokerResult SetRuntimeSettings(RuntimeSettings settings)
     {
         if (!EffectDefinitionValidator.TryValidate(settings, out _))

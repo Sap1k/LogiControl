@@ -11,7 +11,12 @@
 
 namespace {
 
-constexpr DWORD kDfgtVidPid = static_cast<DWORD>(MAKELONG(0x046D, 0xC29A));
+constexpr std::array<DWORD, 4> kClassicWheelVidPids{
+    static_cast<DWORD>(MAKELONG(0x046D, 0xC29A)),
+    static_cast<DWORD>(MAKELONG(0x046D, 0xC29B)),
+    static_cast<DWORD>(MAKELONG(0x046D, 0xC299)),
+    static_cast<DWORD>(MAKELONG(0x046D, 0xC298)),
+};
 constexpr wchar_t kWindowClassName[] = L"LogiControl.DirectInputHarness.Window";
 
 class HarnessWindow final {
@@ -59,6 +64,7 @@ struct DeviceSelection {
     GUID instanceGuid{};
     wchar_t instanceName[MAX_PATH]{};
     wchar_t productName[MAX_PATH]{};
+    DWORD productVidPid{};
     bool found{};
 };
 
@@ -107,14 +113,22 @@ const wchar_t* EffectPrompt(TestEffect effect) {
     return L"Unknown effect.";
 }
 
-BOOL CALLBACK SelectDfgt(const DIDEVICEINSTANCEW* instance, void* context) {
+BOOL CALLBACK SelectClassicWheel(const DIDEVICEINSTANCEW* instance, void* context) {
     auto& selection = *static_cast<DeviceSelection*>(context);
-    if (instance == nullptr || instance->guidProduct.Data1 != kDfgtVidPid) {
+    if (instance == nullptr) {
+        return DIENUM_CONTINUE;
+    }
+    bool supported = false;
+    for (const auto vidPid : kClassicWheelVidPids) {
+        supported = supported || instance->guidProduct.Data1 == vidPid;
+    }
+    if (!supported) {
         return DIENUM_CONTINUE;
     }
     selection.instanceGuid = instance->guidInstance;
     wcscpy_s(selection.instanceName, instance->tszInstanceName);
     wcscpy_s(selection.productName, instance->tszProductName);
+    selection.productVidPid = instance->guidProduct.Data1;
     selection.found = true;
     return DIENUM_STOP;
 }
@@ -218,18 +232,19 @@ int wmain(int argc, wchar_t** argv) {
     DeviceSelection selection{};
     result = directInput->EnumDevices(
         DI8DEVCLASS_GAMECTRL,
-        SelectDfgt,
+        SelectClassicWheel,
         &selection,
         DIEDFL_ATTACHEDONLY);
     if (FAILED(result) || !selection.found) {
         if (FAILED(result)) PrintResult(L"EnumDevices", result);
-        else std::wcerr << L"046D:C29A was not found by DirectInput.\n";
+        else std::wcerr << L"No scoped classic Logitech wheel was found by DirectInput.\n";
         directInput->Release();
         return 3;
     }
 
     std::wcout << L"device: " << selection.productName
-               << L" / " << selection.instanceName << L" (046D:C29A)\n";
+               << L" / " << selection.instanceName << L" (VID:PID="
+               << std::hex << selection.productVidPid << std::dec << L")\n";
 
     IDirectInputDevice8W* device = nullptr;
     result = directInput->CreateDevice(selection.instanceGuid, &device, nullptr);

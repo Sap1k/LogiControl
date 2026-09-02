@@ -17,9 +17,9 @@
         <Border Grid.Row="2" Margin="0,28,0,0" Padding="20"
                 BorderBrush="#FFD6D6D6" BorderThickness="1" CornerRadius="6">
             <StackPanel>
-                <TextBlock FontWeight="SemiBold" Text="Bootstrap status" />
+                <TextBlock FontWeight="SemiBold" Text="UI status" />
                 <TextBlock Margin="0,8,0,0" TextWrapping="Wrap"
-                           Text="The UI shell is ready. Device discovery and broker IPC will be added after the hardware-safe transport layer." />
+                           Text="Device discovery and IPC are implemented in the broker. This UI is a placeholder and is not connected to the broker yet. Use the broker CLI to list and select wheels, view status, and change settings." />
             </StackPanel>
         </Border>
     </Grid>

@@ -135,19 +135,20 @@ public sealed class RuntimeTests
     [InlineData(true)]
     public async Task HidPumpResetBarrierMakesNextForceStart(bool stopAll)
     {
+        var protocol = DfgtProtocol();
         var transport = new DelayedTransport(TimeSpan.Zero);
         using var pump = new CoalescingHidOutputPump(transport);
         pump.PublishSoftwareForce(1_000);
         Assert.True(SpinWait.SpinUntil(() => transport.Reports.Count >= 1, TimeSpan.FromSeconds(2)));
 
-        var reset = new byte[DfgtForceFeedbackReports.ReportLength];
+        var reset = new byte[protocol.ReportLength];
         if (stopAll)
         {
-            DfgtForceFeedbackReports.WriteStopAll(reset);
+            protocol.WriteStopAll(reset);
         }
         else
         {
-            DfgtForceFeedbackReports.WriteSlotStop(reset, 0);
+            protocol.WriteSlotStop(reset, 0);
         }
 
         await pump.PublishBarrierAndWaitAsync(reset, TestContext.Current.CancellationToken);
@@ -162,6 +163,7 @@ public sealed class RuntimeTests
     [Fact]
     public async Task StopAllFenceSuppressesOlderCoalescedForceButAllowsNewStart()
     {
+        var protocol = DfgtProtocol();
         var transport = new GatedTransport();
         using var pump = new CoalescingHidOutputPump(transport);
         pump.PublishSoftwareForce(1_000);
@@ -169,8 +171,8 @@ public sealed class RuntimeTests
             TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken));
 
         pump.PublishSoftwareForce(2_000);
-        var stopAll = new byte[DfgtForceFeedbackReports.ReportLength];
-        DfgtForceFeedbackReports.WriteStopAll(stopAll);
+        var stopAll = new byte[protocol.ReportLength];
+        protocol.WriteStopAll(stopAll);
         Task barrier = pump.PublishBarrierAndWaitAsync(
             stopAll, TestContext.Current.CancellationToken).AsTask();
         pump.PublishSoftwareForce(0);
@@ -191,13 +193,13 @@ public sealed class RuntimeTests
     [Fact]
     public void HidPumpPreservesBarrierOrder()
     {
+        var protocol = DfgtProtocol();
         var transport = new DelayedTransport(TimeSpan.Zero);
         using (var pump = new CoalescingHidOutputPump(transport))
         {
-            Span<byte> range = stackalloc byte[DfgtForceFeedbackReports.ReportLength];
-            DfgtForceFeedbackReports.WriteRange(range, 540);
-            Span<byte> stop = stackalloc byte[DfgtForceFeedbackReports.ReportLength];
-            DfgtForceFeedbackReports.WriteStopAll(stop);
+            byte[] range = Assert.Single(protocol.CreateRangeReports(540));
+            Span<byte> stop = stackalloc byte[protocol.ReportLength];
+            protocol.WriteStopAll(stop);
             pump.PublishBarrier(range);
             pump.PublishBarrier(stop);
             Assert.True(SpinWait.SpinUntil(() => transport.Reports.Count >= 2, TimeSpan.FromSeconds(2)));
@@ -206,6 +208,9 @@ public sealed class RuntimeTests
         Assert.Equal((byte)0xF8, transport.Reports.ElementAt(0)[1]);
         Assert.Equal((byte)0xF3, transport.Reports.ElementAt(1)[1]);
     }
+
+    private static ClassicWheelProtocol DfgtProtocol() =>
+        new(ClassicWheelCatalog.GetDefinition(WheelModel.DrivingForceGT));
 
     [Fact]
     public void HidWriteFailureAttemptsStopAllClosesTransportAndSignalsFault()

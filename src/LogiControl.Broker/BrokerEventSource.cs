@@ -28,4 +28,8 @@ internal sealed class BrokerEventSource : EventSource
     [Event(5, Level = EventLevel.Informational)]
     public void DeviceLifecycle(string previous, string current, string reason) =>
         WriteEvent(5, previous, current, reason);
+
+    [Event(6, Level = EventLevel.Warning)]
+    public void ReadOnlyPresentation(string productId, string revision, string reason) =>
+        WriteEvent(6, productId, revision, reason);
 }

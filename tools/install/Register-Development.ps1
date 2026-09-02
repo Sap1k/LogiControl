@@ -3,6 +3,7 @@
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
     [switch]$ReplaceExistingProvider,
+    [switch]$PlanOnly,
     [string]$Provider64,
     [string]$Provider32
 )
@@ -17,6 +18,35 @@ if (-not $Provider64) {
 if (-not $Provider32) {
     $Provider32 = Join-Path $repoRoot 'out\build\windows-x86\native\LogiControl.Ffb\Release\LogiControl.Ffb.dll'
 }
+$productIds = @('C29A', 'C29B', 'C299', 'C298')
+$clsid = '{32FC17A4-0050-419A-BB41-59B228B5CFF4}'
+$oemBase = 'SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM'
+$oemRoots = foreach ($hive in @('HKLM:', 'HKCU:')) {
+    foreach ($productId in $productIds) {
+        "$hive\$oemBase\VID_046D&PID_$productId"
+    }
+}
+$forceFeedbackRoots = @($oemRoots | ForEach-Object { Join-Path $_ 'OEMForceFeedback' })
+$axisRoots = @($oemRoots | ForEach-Object { Join-Path $_ 'Axes' })
+$class64 = "HKLM:\SOFTWARE\Classes\CLSID\$clsid"
+$class32 = "HKLM:\SOFTWARE\Classes\WOW6432Node\CLSID\$clsid"
+
+if ($PlanOnly) {
+    [ordered]@{
+        changed = $false
+        clsid = $clsid
+        productIds = $productIds
+        oemRoots = $oemRoots
+        forceFeedbackRoots = $forceFeedbackRoots
+        axisRoots = $axisRoots
+        classRoots = @($class64, $class32)
+        operationOrder = @('conflict-check', 'backup', 'com', 'oem-force-feedback', 'axes', 'manifest')
+        conflictPolicy = 'refuse-unless-explicit-replace'
+        uninstallPolicy = 'manifest-owned-only'
+    } | ConvertTo-Json -Depth 4
+    return
+}
+
 foreach ($provider in @($Provider64, $Provider32)) {
     if (-not (Test-Path -LiteralPath $provider -PathType Leaf)) {
         throw "Provider artifact is missing: $provider"
@@ -30,15 +60,6 @@ if (-not $WhatIfPreference -and
     throw 'Run registration from an elevated PowerShell process.'
 }
 
-$clsid = '{32FC17A4-0050-419A-BB41-59B228B5CFF4}'
-$machineOem = 'HKLM:\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A'
-$userOem = 'HKCU:\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A'
-$forceFeedbackRoots = @(
-    (Join-Path $machineOem 'OEMForceFeedback'),
-    (Join-Path $userOem 'OEMForceFeedback')
-)
-$class64 = "HKLM:\SOFTWARE\Classes\CLSID\$clsid"
-$class32 = "HKLM:\SOFTWARE\Classes\WOW6432Node\CLSID\$clsid"
 $manifestPath = Join-Path $repoRoot 'artifacts\development-registration.json'
 $existingManifest = $null
 if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
@@ -46,16 +67,16 @@ if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
     if ([string]$existingManifest.clsid -ne $clsid) {
         throw 'Existing development registration manifest is not owned by LogiControl.'
     }
+    if (-not ($existingManifest.PSObject.Properties.Name -contains 'productIds') -or
+        @($existingManifest.productIds).Count -ne $productIds.Count) {
+        throw 'The existing manifest predates Phase 3. Unregister it before installing the four-wheel plan.'
+    }
 }
 $backupRoot = if ($null -ne $existingManifest) {
     [string]$existingManifest.backupRoot
 } else {
     Join-Path $repoRoot ('artifacts\registration-backups\' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 }
-$axisRoots = @(
-    (Join-Path $machineOem 'Axes'),
-    (Join-Path $userOem 'Axes')
-)
 $axisAttributes = [byte[]](1,1,0,0,1,0,48,0) # FFACTUATOR | ASPECTPOSITION, Generic Desktop/X
 $axisFfAttributes = [byte[]](10,0,0,0,0,1,0,0) # 10 N maximum, 256 force gradations
 
@@ -63,7 +84,7 @@ foreach ($root in $forceFeedbackRoots) {
     if (Test-Path -LiteralPath $root) {
         $owner = (Get-ItemProperty -LiteralPath $root -Name CLSID -ErrorAction SilentlyContinue).CLSID
         if ($owner -and $owner -ne $clsid -and -not $ReplaceExistingProvider) {
-            throw "The C29A registration is owned by $owner. Re-run with -ReplaceExistingProvider only after reviewing the backup path."
+            throw "The registration at $root is owned by $owner. Re-run with -ReplaceExistingProvider only after reviewing the backup path."
         }
     }
 }
@@ -95,12 +116,19 @@ $effects = @(
     @{ Guid='{13541C2B-8E33-11D0-9AD0-00A0C9A06E35}'; Name='Custom Force';  Id=0x100; Type=0x00008605; Parameters=([uint32]($software -bor 2)) }
 )
 
-if ($PSCmdlet.ShouldProcess('VID_046D&PID_C29A', 'Register LogiControl development DirectInput provider')) {
+if ($PSCmdlet.ShouldProcess(($productIds -join ', '), 'Register LogiControl development DirectInput provider')) {
     if ($null -eq $existingManifest) {
         New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
-        $exports = @(
-            @{ Native='HKLM\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A'; File='oem-machine.reg' },
-            @{ Native='HKCU\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A'; File='oem-user.reg' },
+        $exports = @()
+        foreach ($hive in @('HKLM', 'HKCU')) {
+            foreach ($productId in $productIds) {
+                $exports += @{
+                    Native="$hive\$oemBase\VID_046D&PID_$productId"
+                    File="oem-$($hive.ToLowerInvariant())-$($productId.ToLowerInvariant()).reg"
+                }
+            }
+        }
+        $exports += @(
             @{ Native="HKLM\SOFTWARE\Classes\CLSID\$clsid"; File='class64.reg' },
             @{ Native="HKLM\SOFTWARE\Classes\WOW6432Node\CLSID\$clsid"; File='class32.reg' }
         )
@@ -177,11 +205,20 @@ if ($PSCmdlet.ShouldProcess('VID_046D&PID_C29A', 'Register LogiControl developme
         clsid = $clsid
         provider64 = (Resolve-Path $Provider64).Path
         provider32 = (Resolve-Path $Provider32).Path
+        productIds = $productIds
+        oemRoots = $oemRoots
+        forceFeedbackRoots = $forceFeedbackRoots
+        classRoots = @($class64, $class32)
         backupFiles = $backupFiles
         backupRoot = $backupRoot
         axisChanges = $axisChanges
     } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestPath -Encoding utf8NoBOM
 }
 
-[pscustomobject]@{ changed = -not [bool]$WhatIfPreference; clsid = $clsid; backupRoot = $backupRoot } |
+[pscustomobject]@{
+    changed = -not [bool]$WhatIfPreference
+    clsid = $clsid
+    productIds = $productIds
+    backupRoot = $backupRoot
+} |
     ConvertTo-Json

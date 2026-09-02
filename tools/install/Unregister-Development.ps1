@@ -22,14 +22,20 @@ if (-not $WhatIfPreference -and
     throw 'Run unregistration from an elevated PowerShell process.'
 }
 
-$roots = @(
-    'HKLM:\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A\OEMForceFeedback',
-    'HKCU:\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A\OEMForceFeedback'
-)
-$classes = @(
-    "HKLM:\SOFTWARE\Classes\CLSID\$clsid",
-    "HKLM:\SOFTWARE\Classes\WOW6432Node\CLSID\$clsid"
-)
+$roots = if ($manifest.PSObject.Properties.Name -contains 'forceFeedbackRoots') {
+    @($manifest.forceFeedbackRoots | ForEach-Object { [string]$_ })
+} else {
+    @('HKLM:\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A\OEMForceFeedback',
+      'HKCU:\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A\OEMForceFeedback')
+}
+$classes = if ($manifest.PSObject.Properties.Name -contains 'classRoots') {
+    @($manifest.classRoots | ForEach-Object { [string]$_ })
+} else {
+    @("HKLM:\SOFTWARE\Classes\CLSID\$clsid", "HKLM:\SOFTWARE\Classes\WOW6432Node\CLSID\$clsid")
+}
+$productIds = if ($manifest.PSObject.Properties.Name -contains 'productIds') {
+    @($manifest.productIds | ForEach-Object { [string]$_ })
+} else { @('C29A') }
 $axisAttributes = [byte[]](1,1,0,0,1,0,48,0)
 $axisFfAttributes = [byte[]](10,0,0,0,0,1,0,0)
 
@@ -40,7 +46,7 @@ function Test-RegistryKeyEmpty {
     return $key.GetValueNames().Count -eq 0 -and $key.GetSubKeyNames().Count -eq 0
 }
 
-if ($PSCmdlet.ShouldProcess('VID_046D&PID_C29A', 'Remove LogiControl development registration and restore backups')) {
+if ($PSCmdlet.ShouldProcess(($productIds -join ', '), 'Remove LogiControl development registration and restore backups')) {
     foreach ($root in $roots) {
         if (Test-Path -LiteralPath $root) {
             $owner = (Get-ItemProperty -LiteralPath $root -Name CLSID -ErrorAction SilentlyContinue).CLSID
@@ -49,7 +55,15 @@ if ($PSCmdlet.ShouldProcess('VID_046D&PID_C29A', 'Remove LogiControl development
         }
     }
     foreach ($class in $classes) {
-        if (Test-Path -LiteralPath $class) { Remove-Item -LiteralPath $class -Recurse -Force }
+        if (Test-Path -LiteralPath $class) {
+            $inProcPath = Join-Path $class 'InProcServer32'
+            $registeredDll = if (Test-Path -LiteralPath $inProcPath) {
+                (Get-Item -LiteralPath $inProcPath).GetValue('')
+            } else { $null }
+            $ownedDll = if ($class -like '*WOW6432Node*') { [string]$manifest.provider32 } else { [string]$manifest.provider64 }
+            if ($registeredDll -eq $ownedDll) { Remove-Item -LiteralPath $class -Recurse -Force }
+            else { Write-Warning "Skipping COM class no longer owned by LogiControl at $class" }
+        }
     }
     if ($manifest.PSObject.Properties.Name -contains 'axisChanges') {
         foreach ($change in @($manifest.axisChanges)) {

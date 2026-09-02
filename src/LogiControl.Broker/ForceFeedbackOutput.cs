@@ -129,6 +129,7 @@ public sealed class SwitchableForceFeedbackOutputSink : IForceFeedbackOutputSink
 public sealed class CoalescingHidOutputPump : IForceFeedbackOutputSink
 {
     private readonly IHidTransport transport;
+    private readonly ClassicWheelProtocol protocol;
     private readonly IMonotonicClock clock;
     private readonly bool profileEvents;
     private readonly AutoResetEvent wake = new(false);
@@ -145,10 +146,14 @@ public sealed class CoalescingHidOutputPump : IForceFeedbackOutputSink
     private bool disposed;
     private int transportClosed;
 
-    public CoalescingHidOutputPump(IHidTransport transport, IMonotonicClock? clock = null,
-        bool profileEvents = false)
+    public CoalescingHidOutputPump(
+        IHidTransport transport,
+        IMonotonicClock? clock = null,
+        bool profileEvents = false,
+        ClassicWheelProtocol? protocol = null)
     {
         this.transport = transport ?? throw new ArgumentNullException(nameof(transport));
+        this.protocol = protocol ?? ClassicWheelProtocol.Default;
         this.clock = clock ?? new QpcMonotonicClock();
         this.profileEvents = profileEvents;
         worker = new Thread(Run)
@@ -189,10 +194,10 @@ public sealed class CoalescingHidOutputPump : IForceFeedbackOutputSink
 
     public void PublishConditionChange(ConditionSlotChange change)
     {
-        Span<byte> report = stackalloc byte[DfgtForceFeedbackReports.ReportLength];
+        Span<byte> report = stackalloc byte[protocol.ReportLength];
         if (change.Change == ConditionChangeKind.Stop)
         {
-            DfgtForceFeedbackReports.WriteSlotStop(report, change.Slot);
+            protocol.WriteSlotStop(report, change.Slot);
         }
         else
         {
@@ -201,27 +206,7 @@ public sealed class CoalescingHidOutputPump : IForceFeedbackOutputSink
             FirmwareSlotOperation operation = change.Change == ConditionChangeKind.Start
                 ? FirmwareSlotOperation.Start
                 : FirmwareSlotOperation.Update;
-            switch (definition.Kind)
-            {
-                case ForceEffectKind.Spring:
-                    DfgtForceFeedbackReports.WriteSpring(report, change.Slot, operation, definition.Offset,
-                        definition.DeadBand, definition.NegativeCoefficient, definition.PositiveCoefficient,
-                        definition.NegativeSaturation, definition.PositiveSaturation);
-                    break;
-                case ForceEffectKind.Friction:
-                    DfgtForceFeedbackReports.WriteFriction(report, change.Slot, operation, definition.Offset,
-                        definition.DeadBand, definition.NegativeCoefficient, definition.PositiveCoefficient,
-                        definition.NegativeSaturation, definition.PositiveSaturation);
-                    break;
-                case ForceEffectKind.Damper:
-                case ForceEffectKind.Inertia:
-                    DfgtForceFeedbackReports.WriteDamper(report, change.Slot, operation, definition.Offset,
-                        definition.DeadBand, definition.NegativeCoefficient, definition.PositiveCoefficient,
-                        definition.NegativeSaturation, definition.PositiveSaturation);
-                    break;
-                default:
-                    throw new ArgumentOutOfRangeException(nameof(change), "Unsupported condition effect.");
-            }
+            protocol.WriteCondition(report, change.Slot, operation, definition);
         }
 
         PublishBarrier(report);
@@ -265,7 +250,7 @@ public sealed class CoalescingHidOutputPump : IForceFeedbackOutputSink
     private void Run()
     {
         var waits = new WaitHandle[] { wake, shutdown };
-        var constantReport = new byte[DfgtForceFeedbackReports.ReportLength];
+        var constantReport = new byte[protocol.ReportLength];
         try
         {
             while (WaitHandle.WaitAny(waits) == 0)
@@ -299,7 +284,7 @@ public sealed class CoalescingHidOutputPump : IForceFeedbackOutputSink
                         FirmwareSlotOperation operation = slotZeroStarted
                             ? FirmwareSlotOperation.Update
                             : FirmwareSlotOperation.Start;
-                        DfgtForceFeedbackReports.WriteConstant(constantReport, 0, operation, force);
+                        protocol.WriteConstant(constantReport, 0, operation, force);
                         Write(constantReport, Volatile.Read(ref desiredPublishedAt));
                         slotZeroStarted = true;
                     }
@@ -329,8 +314,8 @@ public sealed class CoalescingHidOutputPump : IForceFeedbackOutputSink
 
             try
             {
-                var stopAll = new byte[DfgtForceFeedbackReports.ReportLength];
-                DfgtForceFeedbackReports.WriteStopAll(stopAll);
+                var stopAll = new byte[protocol.ReportLength];
+                protocol.WriteStopAll(stopAll);
                 Write(stopAll, clock.GetMicroseconds());
             }
             catch
@@ -369,9 +354,10 @@ public sealed class CoalescingHidOutputPump : IForceFeedbackOutputSink
     private void EnqueueBarrier(ReadOnlySpan<byte> report, TaskCompletionSource? completion)
     {
         ObjectDisposedException.ThrowIf(disposed, this);
-        if (report.Length != DfgtForceFeedbackReports.ReportLength)
+        if (report.Length != protocol.ReportLength)
         {
-            throw new ArgumentException("DFGT reports must be exactly eight bytes.", nameof(report));
+            throw new ArgumentException(
+                $"Reports must be exactly {protocol.ReportLength} bytes for the active protocol.", nameof(report));
         }
 
         long? forceResetVersion = IsSlotZeroReset(report)

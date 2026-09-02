@@ -24,6 +24,8 @@ public enum IpcMessageType : ushort
     QueryStatus = 32,
     QueryTelemetry = 33,
     EmergencyStop = 34,
+    QueryWheelCandidates = 35,
+    SelectWheel = 36,
 }
 
 [Flags]
@@ -61,7 +63,7 @@ public static class IpcFrameCodec
 {
     public const uint Magic = 0x4646434C;
     public const ushort MajorVersion = 1;
-    public const ushort MinorVersion = 0;
+    public const ushort MinorVersion = 1;
     public const int HeaderLength = 32;
     public const int MaximumFrameLength = 64 * 1024;
     public const int MaximumPayloadLength = MaximumFrameLength - HeaderLength;

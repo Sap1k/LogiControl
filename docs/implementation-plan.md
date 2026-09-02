@@ -137,9 +137,9 @@ Managed protocol/device types:
 - `WheelDefinition`
 - `HidDeviceSnapshot`
 - `WheelIdentity`
-- `IWheelProtocol`
+- `ClassicWheelProtocol`
 - `IHidTransport`
-- `WheelSessionManager`
+- `BrokerDeviceManager`
 
 The HID transport exposes control-transfer `SetOutputReport` separately from
 continuous `WriteOutputReport`; callers cannot silently substitute one for the
@@ -293,22 +293,56 @@ and IPC. Pipe loss destroys broker-owned effect state and issues StopAll. The
 
 ## Phase 3: generalized classic-wheel support
 
+Implementation status on 2026-09-01: implemented, automated-test-only. DFGT,
+G27, G25, and Driving Force Pro share one catalog-driven classic protocol and
+one globally managed runtime. No Phase 3 hardware behavior has been promoted
+from deterministic tests to physically verified support.
+
 ### Work
 
 - Add typed definitions in order: G27, G25, DFP.
 - Generate native-PID registration for C29A, C29B, C299, and C298.
 - Add EXT_CMD9, EXT_CMD16, and EXT_CMD1 switching strategies.
-- Add `F8 81` range for DFGT/G25/G27 and DFP coarse-plus-fine range.
-- Support multiple independent physical device sessions while allowing one
-  active DirectInput owner per wheel.
+- Add continuous 40°–900° `F8 81` range control for DFGT/G25/G27. Restrict DFP
+  to explicit native 200° and 900° reports. No intermediate DFP range encoder
+  exists because using one safely would also require input-axis rescaling
+  outside the current architecture.
+- Coalesce simultaneous USB presentations into physical candidates before
+  applying the eight-candidate bound. Broker-lifetime IDs retain accumulated
+  container, location, parent, and instance aliases. Auto-select only one
+  unambiguous physical wheel; multiple wheels or ambiguous writable endpoints
+  remain read-only until the ambiguity is resolved or an explicit broker ID is
+  selected. A pinned selection remains pinned across removal and never
+  transfers force ownership to another wheel.
+- Keep a single 500 Hz runtime, HID sink, and DirectInput owner globally.
+  Selection changes StopAll, invalidate effects/bindings, close the old
+  transport, restore broker-lifetime settings for the selected identity and
+  location, then initialize the new wheel.
+- Give each selection a monotonic revision and cancellable transition lease.
+  Selection changes invalidate readiness immediately and supersede calibration,
+  switching, polling, settling, initialization, and the final ready barrier.
+  Every open and HID write revalidates the lease; partial attachment is stopped
+  and disposed without publishing the superseded wheel as ready or faulted.
+- Use only the classic direct-constant `0x00` command for all catalog wheels,
+  placing the force byte in the selected slot field. The implementation has no
+  `0x08` variable-force encoder or runtime branch. Class gain changes spring/damper/friction
+  saturation only; direction and effect/game/master gains scale coefficients
+  and saturation, and active condition slots refresh immediately.
+- Add additive IPC v1.1 candidate list/selection messages while accepting v1.0
+  providers. BindDevice must name the exact currently selected ready HID path.
+- Read steering logical bounds from HID value capabilities before calibration,
+  rather than deriving them from a PID.
 - Defer G29/G923, LEDs, pedal remapping, and arbitrary compatibility-mode
   selection.
 
 ### Tests and done
 
-Use table-driven identity/command/registration tests, fake two-wheel tests, and
-the common physical certification checklist. A model remains experimental until
-recorded hardware results pass the matrix.
+Table-driven identity, switch, range, report, registration-plan, IPC, transition
+supersession, presentation-coalescing, and fake two-wheel ownership tests are
+present. Phase 1 DFGT `0x08` reports remain documented historical evidence only;
+the active universal `0x00` path is automated-test-only. Each
+model remains experimental until recorded hardware results pass the common
+checklist in the hardware matrix.
 
 ## Phase 4: profiles, UI, packaging, and polish
 

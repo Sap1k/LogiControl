@@ -156,6 +156,9 @@ HRESULT MarshalEffect(
             (source.dwFlags & DIEFF_CARTESIAN) == 0 || !SignedMagnitude(source.rglDirection[0])) {
             return DIERR_INVALIDPARAM;
         }
+        // DirectInput documents Cartesian zero for single-axis effects. It selects
+        // the default orientation, not zero magnitude: keep a positive unit gain.
+        // https://learn.microsoft.com/en-us/previous-versions/windows/desktop/ee417536(v=vs.85)#single-axis-effects
         target.direction = source.rglDirection[0] < 0 ? -10000 : 10000;
         AddMask(updateMask, EffectUpdateMask::Direction);
     }

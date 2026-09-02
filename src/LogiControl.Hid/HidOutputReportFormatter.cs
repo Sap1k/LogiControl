@@ -10,6 +10,11 @@ public static class HidOutputReportFormatter
 
     public static byte[] FormatUnnumberedCommand(
         LogitechCommand command,
+        ushort outputReportByteLength) => FormatCommand(command, 0, outputReportByteLength);
+
+    public static byte[] FormatCommand(
+        LogitechCommand command,
+        byte reportId,
         ushort outputReportByteLength)
     {
         ArgumentNullException.ThrowIfNull(command);
@@ -22,6 +27,7 @@ public static class HidOutputReportFormatter
         }
 
         var report = new byte[outputReportByteLength];
+        report[0] = reportId;
         command.Bytes.Span.CopyTo(report.AsSpan(1));
         return report;
     }

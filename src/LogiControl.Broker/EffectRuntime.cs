@@ -26,18 +26,24 @@ public sealed partial class EffectRuntime : IDisposable
     private readonly Thread thread;
     private readonly RuntimeTelemetry telemetry = new();
     private readonly bool profileEvents;
+    private ClassicWheelProtocol protocol;
     private bool hadActiveEffects;
     private int appliedRange = int.MinValue;
     private int appliedIdleAutocenter = int.MinValue;
     private bool disposed;
 
-    public EffectRuntime(IRuntimeMixer mixer, IMonotonicClock clock, IForceFeedbackOutputSink output,
-        bool profileEvents = false)
+    public EffectRuntime(
+        IRuntimeMixer mixer,
+        IMonotonicClock clock,
+        IForceFeedbackOutputSink output,
+        bool profileEvents = false,
+        ClassicWheelProtocol? protocol = null)
     {
         this.mixer = mixer ?? throw new ArgumentNullException(nameof(mixer));
         this.clock = clock ?? throw new ArgumentNullException(nameof(clock));
         this.output = output ?? throw new ArgumentNullException(nameof(output));
         this.profileEvents = profileEvents;
+        this.protocol = protocol ?? ClassicWheelProtocol.Default;
         thread = new Thread(Run)
         {
             IsBackground = true,
@@ -57,8 +63,13 @@ public sealed partial class EffectRuntime : IDisposable
 
     public void Start() => thread.Start();
 
-    internal void ResetOutputPolicyForAttach()
+    internal void ResetOutputPolicyForAttach(ClassicWheelProtocol? activeProtocol = null)
     {
+        if (activeProtocol is not null)
+        {
+            protocol = activeProtocol;
+        }
+
         appliedRange = int.MinValue;
         appliedIdleAutocenter = int.MinValue;
         hadActiveEffects = false;
@@ -101,8 +112,8 @@ public sealed partial class EffectRuntime : IDisposable
             thread.Join();
         }
 
-        Span<byte> stopAll = stackalloc byte[Protocol.DfgtForceFeedbackReports.ReportLength];
-        Protocol.DfgtForceFeedbackReports.WriteStopAll(stopAll);
+        Span<byte> stopAll = stackalloc byte[protocol.ReportLength];
+        protocol.WriteStopAll(stopAll);
         output.PublishBarrier(stopAll);
         commandReady.Dispose();
         shutdown.Dispose();
@@ -254,25 +265,26 @@ public sealed partial class EffectRuntime : IDisposable
         MixerSnapshot snapshot = mixer.Render();
         if (mixer.TryConsumeStopAllBarrier())
         {
-            Span<byte> stopAll = stackalloc byte[DfgtForceFeedbackReports.ReportLength];
-            DfgtForceFeedbackReports.WriteStopAll(stopAll);
+            Span<byte> stopAll = stackalloc byte[protocol.ReportLength];
+            protocol.WriteStopAll(stopAll);
             output.PublishBarrier(stopAll);
         }
 
         RuntimeSettings settings = mixer.RuntimeSettings;
         if (settings.RangeDegrees != appliedRange)
         {
-            Span<byte> range = stackalloc byte[Protocol.DfgtForceFeedbackReports.ReportLength];
-            Protocol.DfgtForceFeedbackReports.WriteRange(range, settings.RangeDegrees);
-            output.PublishBarrier(range);
+            foreach (byte[] range in protocol.CreateRangeReports(settings.RangeDegrees))
+            {
+                output.PublishBarrier(range);
+            }
             appliedRange = settings.RangeDegrees;
         }
 
         bool active = snapshot.ActiveEffectCount > 0;
         if (active && !hadActiveEffects)
         {
-            Span<byte> disable = stackalloc byte[Protocol.DfgtForceFeedbackReports.ReportLength];
-            Protocol.DfgtForceFeedbackReports.WriteDisableAutocenter(disable);
+            Span<byte> disable = stackalloc byte[protocol.ReportLength];
+            protocol.WriteDisableAutocenter(disable);
             output.PublishBarrier(disable);
         }
 
@@ -286,21 +298,21 @@ public sealed partial class EffectRuntime : IDisposable
         {
             if (hadActiveEffects)
             {
-                Span<byte> stop = stackalloc byte[Protocol.DfgtForceFeedbackReports.ReportLength];
-                Protocol.DfgtForceFeedbackReports.WriteSlotStop(stop, 0);
+                Span<byte> stop = stackalloc byte[protocol.ReportLength];
+                protocol.WriteSlotStop(stop, 0);
                 output.PublishBarrier(stop);
             }
 
-            Span<byte> autocenter = stackalloc byte[Protocol.DfgtForceFeedbackReports.ReportLength];
-            Protocol.DfgtForceFeedbackReports.WriteAutocenterParameters(autocenter, settings.IdleAutocenter);
+            Span<byte> autocenter = stackalloc byte[protocol.ReportLength];
+            protocol.WriteAutocenterParameters(autocenter, settings.IdleAutocenter);
             output.PublishBarrier(autocenter);
             if (settings.IdleAutocenter > 0)
             {
-                Protocol.DfgtForceFeedbackReports.WriteEnableAutocenter(autocenter);
+                protocol.WriteEnableAutocenter(autocenter);
             }
             else
             {
-                Protocol.DfgtForceFeedbackReports.WriteDisableAutocenter(autocenter);
+                protocol.WriteDisableAutocenter(autocenter);
             }
 
             output.PublishBarrier(autocenter);

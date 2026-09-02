@@ -159,6 +159,38 @@ public sealed class BrokerSessionCoordinatorTests
         Assert.Equal(new[] { ConditionChangeKind.Start, ConditionChangeKind.Stop }, changes);
     }
 
+    [Fact]
+    public void RuntimeSettingsApplyToActiveInactiveAndNewSessions()
+    {
+        var coordinator = new BrokerSessionCoordinator(new FakeClock());
+        Assert.Equal(BrokerResult.Ok, coordinator.OpenSession(out ulong first));
+        Assert.Equal(BrokerResult.Ok, coordinator.OpenSession(out ulong second));
+        uint firstHandle = DownloadConstant(coordinator, first);
+        uint secondHandle = DownloadConstant(coordinator, second);
+        Assert.Equal(BrokerResult.Ok, coordinator.StartEffect(first, firstHandle, 1, false, true));
+        Assert.Equal(1_000, coordinator.Render().SoftwareForce);
+
+        RuntimeSettings settings = RuntimeSettings.Default with { MasterGain = 5_000 };
+        Assert.Equal(BrokerResult.Ok, coordinator.SetRuntimeSettings(settings));
+        Assert.Equal(settings, coordinator.RuntimeSettings);
+        Assert.Equal(500, coordinator.Render().SoftwareForce);
+
+        Assert.Equal(BrokerResult.InvalidArgument,
+            coordinator.SetRuntimeSettings(settings with { MasterGain = -1 }));
+        Assert.Equal(settings, coordinator.RuntimeSettings);
+        Assert.Equal(500, coordinator.Render().SoftwareForce);
+
+        Assert.Equal(BrokerResult.Ok, coordinator.StopEffect(first, firstHandle));
+        Assert.Equal(BrokerResult.Ok, coordinator.StartEffect(second, secondHandle, 1, false, true));
+        Assert.Equal(500, coordinator.Render().SoftwareForce);
+        Assert.Equal(BrokerResult.Ok, coordinator.StopEffect(second, secondHandle));
+
+        Assert.Equal(BrokerResult.Ok, coordinator.OpenSession(out ulong third));
+        uint thirdHandle = DownloadConstant(coordinator, third);
+        Assert.Equal(BrokerResult.Ok, coordinator.StartEffect(third, thirdHandle, 1, false, true));
+        Assert.Equal(500, coordinator.Render().SoftwareForce);
+    }
+
     private static uint DownloadConstant(BrokerSessionCoordinator coordinator, ulong session)
     {
         Assert.Equal(BrokerResult.Ok, coordinator.UpsertEffect(session, 0, EffectUpdateMask.All,

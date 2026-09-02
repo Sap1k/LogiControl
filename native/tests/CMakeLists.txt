@@ -30,9 +30,11 @@ add_test(NAME effect-marshaller COMMAND LogiControl.EffectMarshallerTests)
 add_test(
     NAME provider-com-abi
     COMMAND LogiControl.ComAbiSmoke $<TARGET_FILE:LogiControl.Ffb>)
-add_test(
-    NAME provider-lazy-device-open
-    COMMAND LogiControl.ComAbiSmoke
-        $<TARGET_FILE:LogiControl.Ffb>
-        [[\\?\hid#vid_046d&pid_c29a#lazy-open-test]]
-        --open-only)
+foreach(product_id IN ITEMS c29a c29b c299 c298)
+    add_test(
+        NAME provider-lazy-device-open-${product_id}
+        COMMAND LogiControl.ComAbiSmoke
+            $<TARGET_FILE:LogiControl.Ffb>
+            [[\\?\hid#vid_046d&pid_${product_id}#lazy-open-test]]
+            --open-only)
+endforeach()

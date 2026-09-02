@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 using System.Buffers.Binary;
+using System.Text;
 using LogiControl.Protocol;
 
 namespace LogiControl.Broker;
@@ -12,19 +13,50 @@ public sealed class BrokerRequestDispatcher
     private readonly BrokerSessionCoordinator coordinator;
     private readonly EffectRuntime runtime;
     private readonly Func<bool> deviceReady;
+    private readonly Func<string, bool> bindDevice;
+    private readonly Func<IReadOnlyList<WheelCandidateInfo>> wheelCandidates;
+    private readonly Func<ulong, bool> selectWheel;
+    private readonly Func<RuntimeSettings, BrokerResult> setRuntimeSettings;
     private ulong sessionId;
-    private bool bound;
+    private string? boundDevicePath;
 
     public BrokerRequestDispatcher(BrokerSessionCoordinator coordinator, EffectRuntime runtime, bool deviceReady)
-        : this(coordinator, runtime, () => deviceReady)
+        : this(coordinator, runtime, _ => deviceReady, () => deviceReady, static () => [], static _ => false)
     {
     }
 
     public BrokerRequestDispatcher(BrokerSessionCoordinator coordinator, EffectRuntime runtime, Func<bool> deviceReady)
+        : this(coordinator, runtime, _ => deviceReady(), deviceReady, static () => [], static _ => false)
+    {
+    }
+
+    public BrokerRequestDispatcher(
+        BrokerSessionCoordinator coordinator,
+        EffectRuntime runtime,
+        Func<string, bool> bindDevice,
+        Func<IReadOnlyList<WheelCandidateInfo>> wheelCandidates,
+        Func<ulong, bool> selectWheel)
+        : this(coordinator, runtime, bindDevice,
+            () => wheelCandidates().Any(static candidate => candidate.IsReady), wheelCandidates, selectWheel)
+    {
+    }
+
+    public BrokerRequestDispatcher(
+        BrokerSessionCoordinator coordinator,
+        EffectRuntime runtime,
+        Func<string, bool> bindDevice,
+        Func<bool> deviceReady,
+        Func<IReadOnlyList<WheelCandidateInfo>> wheelCandidates,
+        Func<ulong, bool> selectWheel,
+        Func<RuntimeSettings, BrokerResult>? setRuntimeSettings = null)
     {
         this.coordinator = coordinator ?? throw new ArgumentNullException(nameof(coordinator));
         this.runtime = runtime ?? throw new ArgumentNullException(nameof(runtime));
         this.deviceReady = deviceReady ?? throw new ArgumentNullException(nameof(deviceReady));
+        this.bindDevice = bindDevice ?? throw new ArgumentNullException(nameof(bindDevice));
+        this.wheelCandidates = wheelCandidates ?? throw new ArgumentNullException(nameof(wheelCandidates));
+        this.selectWheel = selectWheel ?? throw new ArgumentNullException(nameof(selectWheel));
+        this.setRuntimeSettings = setRuntimeSettings ?? coordinator.SetRuntimeSettings;
     }
 
     public ulong SessionId => sessionId;
@@ -74,6 +106,12 @@ public sealed class BrokerRequestDispatcher
             IpcMessageType.QueryStatus => QueryStatus(header, request.Payload),
             IpcMessageType.QueryTelemetry => QueryTelemetry(header, request.Payload),
             IpcMessageType.EmergencyStop => EmergencyStop(header, request.Payload),
+            IpcMessageType.QueryWheelCandidates => header.MinorVersion >= 1
+                ? QueryWheelCandidates(header, request.Payload)
+                : Response(header, BrokerResult.Unsupported),
+            IpcMessageType.SelectWheel => header.MinorVersion >= 1
+                ? SelectWheel(header, request.Payload)
+                : Response(header, BrokerResult.Unsupported),
             _ => Response(header, BrokerResult.Unsupported),
         };
     }
@@ -87,7 +125,7 @@ public sealed class BrokerRequestDispatcher
 
         ulong closing = sessionId;
         sessionId = 0;
-        bound = false;
+        boundDevicePath = null;
         try
         {
             _ = runtime.Invoke(() => coordinator.CloseSession(closing), TimeSpan.FromMilliseconds(250));
@@ -110,8 +148,24 @@ public sealed class BrokerRequestDispatcher
             return Response(header, BrokerResult.InvalidArgument);
         }
 
-        bound = deviceReady();
-        return Response(header, bound ? BrokerResult.Ok : BrokerResult.DeviceNotReady);
+        string path;
+        try
+        {
+            path = new UTF8Encoding(false, true).GetString(payload, 2, length);
+        }
+        catch (DecoderFallbackException)
+        {
+            return Response(header, BrokerResult.InvalidArgument);
+        }
+
+        if (string.IsNullOrWhiteSpace(path) || !bindDevice(path))
+        {
+            boundDevicePath = null;
+            return Response(header, BrokerResult.DeviceNotReady);
+        }
+
+        boundDevicePath = path;
+        return Response(header, BrokerResult.Ok);
     }
 
     private IpcFrame ValidateEffect(IpcFrameHeader header, byte[] payload)
@@ -146,6 +200,11 @@ public sealed class BrokerRequestDispatcher
             return Response(header, BrokerResult.InvalidArgument);
         }
 
+        if (!BindingIsReady())
+        {
+            return Response(header, BrokerResult.DeviceNotReady);
+        }
+
         uint handle = BinaryPrimitives.ReadUInt32LittleEndian(payload);
         var mask = (EffectUpdateMask)BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(4));
         uint assigned = 0;
@@ -164,7 +223,7 @@ public sealed class BrokerRequestDispatcher
             return Response(header, BrokerResult.InvalidArgument);
         }
 
-        if (!bound || !deviceReady())
+        if (!BindingIsReady())
         {
             return Response(header, BrokerResult.DeviceNotReady);
         }
@@ -191,6 +250,11 @@ public sealed class BrokerRequestDispatcher
         if (payload.Length != 4)
         {
             return Response(header, BrokerResult.InvalidArgument);
+        }
+
+        if (!BindingIsReady())
+        {
+            return Response(header, BrokerResult.DeviceNotReady);
         }
 
         uint handle = BinaryPrimitives.ReadUInt32LittleEndian(payload);
@@ -232,6 +296,11 @@ public sealed class BrokerRequestDispatcher
             return Response(header, BrokerResult.InvalidArgument);
         }
 
+        if (!BindingIsReady())
+        {
+            return Response(header, BrokerResult.DeviceNotReady);
+        }
+
         int gain = BinaryPrimitives.ReadInt32LittleEndian(payload);
         return Response(header, runtime.Invoke(() => coordinator.SetGain(sessionId, gain), TimeSpan.FromMilliseconds(250)));
     }
@@ -241,6 +310,11 @@ public sealed class BrokerRequestDispatcher
         if (payload.Length != 4 || payload[1] != 0 || payload[2] != 0 || payload[3] != 0)
         {
             return Response(header, BrokerResult.InvalidArgument);
+        }
+
+        if (!BindingIsReady())
+        {
+            return Response(header, BrokerResult.DeviceNotReady);
         }
 
         var command = (DeviceForceCommand)payload[0];
@@ -287,7 +361,7 @@ public sealed class BrokerRequestDispatcher
         var settings = new RuntimeSettings(
             ReadInt(payload, 0), ReadInt(payload, 4), ReadInt(payload, 8), ReadInt(payload, 12),
             ReadInt(payload, 16), ReadInt(payload, 20), ReadInt(payload, 24), ReadInt(payload, 28));
-        return Response(header, runtime.Invoke(() => coordinator.SetRuntimeSettings(settings), TimeSpan.FromMilliseconds(250)));
+        return Response(header, runtime.Invoke(() => setRuntimeSettings(settings), TimeSpan.FromMilliseconds(250)));
     }
 
     private IpcFrame QueryRuntimeSettings(IpcFrameHeader header, byte[] payload)
@@ -362,6 +436,40 @@ public sealed class BrokerRequestDispatcher
     private IpcFrame EmergencyStop(IpcFrameHeader header, byte[] payload) =>
         NoPayload(header, payload, coordinator.EmergencyStop);
 
+    private IpcFrame QueryWheelCandidates(IpcFrameHeader header, byte[] payload)
+    {
+        if (payload.Length != 0)
+        {
+            return Response(header, BrokerResult.InvalidArgument);
+        }
+
+        try
+        {
+            return Response(header, BrokerResult.Ok, WheelCandidateCodec.Encode(wheelCandidates()));
+        }
+        catch (ArgumentException)
+        {
+            return Response(header, BrokerResult.InternalError);
+        }
+    }
+
+    private IpcFrame SelectWheel(IpcFrameHeader header, byte[] payload)
+    {
+        if (payload.Length != sizeof(ulong))
+        {
+            return Response(header, BrokerResult.InvalidArgument);
+        }
+
+        ulong id = BinaryPrimitives.ReadUInt64LittleEndian(payload);
+        if (!selectWheel(id))
+        {
+            return Response(header, BrokerResult.NotFound);
+        }
+
+        boundDevicePath = null;
+        return Response(header, BrokerResult.Ok);
+    }
+
     private IpcFrame Close(IpcFrameHeader header, byte[] payload)
     {
         if (payload.Length != 0)
@@ -372,7 +480,7 @@ public sealed class BrokerRequestDispatcher
         BrokerResult result = runtime.Invoke(() => coordinator.CloseSession(sessionId), TimeSpan.FromMilliseconds(250));
         ulong closed = sessionId;
         sessionId = 0;
-        bound = false;
+        boundDevicePath = null;
         return Response(header, result, sessionOverride: closed);
     }
 
@@ -392,7 +500,7 @@ public sealed class BrokerRequestDispatcher
         extra.CopyTo(payload.AsSpan(4));
         var header = new IpcFrameHeader(
             IpcFrameCodec.MajorVersion,
-            IpcFrameCodec.MinorVersion,
+            Math.Min(request.MinorVersion, IpcFrameCodec.MinorVersion),
             request.MessageType,
             IpcFrameFlags.Response | (result == BrokerResult.Ok ? IpcFrameFlags.None : IpcFrameFlags.Error),
             (uint)payload.Length,
@@ -406,4 +514,7 @@ public sealed class BrokerRequestDispatcher
 
     private static void WriteInt(Span<byte> destination, int offset, int value) =>
         BinaryPrimitives.WriteInt32LittleEndian(destination[offset..], value);
+
+    private bool BindingIsReady() =>
+        boundDevicePath is not null && bindDevice(boundDevicePath);
 }

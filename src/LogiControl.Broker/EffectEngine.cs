@@ -695,18 +695,18 @@ public sealed class EffectEngine : IRuntimeMixer
         };
         long signedGain = condition.Common.Direction;
         signedGain = Scale(signedGain, condition.Common.Gain);
-        signedGain = Scale(signedGain, classGain);
         signedGain = Scale(signedGain, gameGain);
         signedGain = Scale(signedGain, settings.MasterGain);
-        int magnitudeGain = (int)Math.Abs(signedGain);
+        int responseGain = (int)Math.Abs(signedGain);
+        int saturationGain = (int)Scale(responseGain, classGain);
         var common = condition.Common with { Gain = 10_000, Direction = 10_000 };
         return condition with
         {
             Common = common,
             PositiveCoefficient = (int)Scale(condition.PositiveCoefficient, (int)signedGain),
             NegativeCoefficient = (int)Scale(condition.NegativeCoefficient, (int)signedGain),
-            PositiveSaturation = (int)Scale(condition.PositiveSaturation, magnitudeGain),
-            NegativeSaturation = (int)Scale(condition.NegativeSaturation, magnitudeGain),
+            PositiveSaturation = (int)Scale(condition.PositiveSaturation, saturationGain),
+            NegativeSaturation = (int)Scale(condition.NegativeSaturation, saturationGain),
         };
     }
 

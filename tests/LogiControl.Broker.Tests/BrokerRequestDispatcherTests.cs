@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 using System.Buffers.Binary;
+using System.Text;
 using LogiControl.Protocol;
 
 namespace LogiControl.Broker.Tests;
@@ -57,6 +58,23 @@ public sealed class BrokerRequestDispatcherTests
     }
 
     [Fact]
+    public void EffectMutationIsRejectedBeforeSuccessfulBinding()
+    {
+        using var fixture = new RuntimeFixture(deviceReady: true);
+        IpcFrame hello = fixture.Dispatcher.Dispatch(Request(IpcMessageType.Hello, 1, 0, []));
+        var effect = new ConstantEffectDefinition(
+            new EffectCommon(1_000, 0, 0, 10_000, 10_000, null), 1_000);
+        byte[] encoded = new byte[EffectDefinitionCodec.GetEncodedLength(effect)];
+        Assert.True(EffectDefinitionCodec.TryWrite(encoded, effect, out _));
+        var payload = new byte[8 + encoded.Length];
+        BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(4), (ushort)EffectUpdateMask.All);
+        encoded.CopyTo(payload, 8);
+
+        Assert.Equal(BrokerResult.DeviceNotReady, Result(fixture.Dispatcher.Dispatch(
+            Request(IpcMessageType.UpsertEffect, 2, hello.Header.SessionId, payload))));
+    }
+
+    [Fact]
     public void StartIsRejectedIfDeviceIsRemovedAfterSuccessfulBinding()
     {
         bool ready = true;
@@ -86,6 +104,68 @@ public sealed class BrokerRequestDispatcherTests
             Request(IpcMessageType.Heartbeat, 3, hello.Header.SessionId + 1, []))));
         Assert.Equal(BrokerResult.InvalidArgument, Result(dispatcher.Dispatch(
             Request(IpcMessageType.Heartbeat, 4, hello.Header.SessionId, [1]))));
+    }
+
+    [Fact]
+    public void Version10ClientRemainsAcceptedAndReceivesVersion10Response()
+    {
+        using var fixture = new RuntimeFixture(deviceReady: true);
+
+        IpcFrame response = fixture.Dispatcher.Dispatch(Request(IpcMessageType.Hello, 1, 0, [], minorVersion: 0));
+
+        Assert.Equal(BrokerResult.Ok, Result(response));
+        Assert.Equal((ushort)0, response.Header.MinorVersion);
+    }
+
+    [Fact]
+    public void BindingRequiresExactSelectedReadyPathAndIsInvalidatedBySelectionChange()
+    {
+        string selectedPath = "path-selected";
+        using var fixture = new RuntimeFixture(path => string.Equals(path, selectedPath, StringComparison.Ordinal));
+        IpcFrame hello = fixture.Dispatcher.Dispatch(Request(IpcMessageType.Hello, 1, 0, []));
+
+        Assert.Equal(BrokerResult.DeviceNotReady, Result(fixture.Dispatcher.Dispatch(
+            Request(IpcMessageType.BindDevice, 2, hello.Header.SessionId, BindPayload("path-invented")))));
+        Assert.Equal(BrokerResult.Ok, Result(fixture.Dispatcher.Dispatch(
+            Request(IpcMessageType.BindDevice, 3, hello.Header.SessionId, BindPayload(selectedPath)))));
+
+        selectedPath = "path-other-wheel";
+        Assert.Equal(BrokerResult.DeviceNotReady, Result(fixture.Dispatcher.Dispatch(
+            Request(IpcMessageType.StartEffect, 4, hello.Header.SessionId, new byte[12]))));
+    }
+
+    [Fact]
+    public void Version11ListsCandidatesAndSelectsBoundedDeviceId()
+    {
+        ulong selected = ulong.MaxValue;
+        WheelCandidateInfo[] candidates =
+        [
+            new(7, WheelModel.G27, "G27 Racing Wheel", 0x1234, 0xC29B, "path-g27", 7, true, true),
+        ];
+        using var fixture = new RuntimeFixture(
+            static _ => true,
+            () => candidates,
+            id =>
+            {
+                selected = id;
+                return id is 0 or 7;
+            });
+        IpcFrame hello = fixture.Dispatcher.Dispatch(Request(
+            IpcMessageType.Hello, 1, 0, [], minorVersion: 1));
+
+        IpcFrame listed = fixture.Dispatcher.Dispatch(Request(
+            IpcMessageType.QueryWheelCandidates, 2, hello.Header.SessionId, [], minorVersion: 1));
+        Assert.Equal(BrokerResult.Ok, Result(listed));
+        Assert.True(WheelCandidateCodec.TryDecode(listed.Payload.AsSpan(4), out IReadOnlyList<WheelCandidateInfo>? decoded));
+        Assert.Equal(candidates, decoded);
+
+        var selection = new byte[8];
+        BinaryPrimitives.WriteUInt64LittleEndian(selection, 7);
+        Assert.Equal(BrokerResult.Ok, Result(fixture.Dispatcher.Dispatch(Request(
+            IpcMessageType.SelectWheel, 3, hello.Header.SessionId, selection, minorVersion: 1))));
+        Assert.Equal((ulong)7, selected);
+        Assert.Equal(BrokerResult.InvalidArgument, Result(fixture.Dispatcher.Dispatch(Request(
+            IpcMessageType.SelectWheel, 4, hello.Header.SessionId, [1], minorVersion: 1))));
     }
 
     [Fact]
@@ -146,8 +226,23 @@ public sealed class BrokerRequestDispatcherTests
             await IpcFrameStream.ReadAsync(stream, TestContext.Current.CancellationToken));
     }
 
-    private static IpcFrame Request(IpcMessageType type, ulong requestId, ulong sessionId, byte[] payload) =>
-        new(new IpcFrameHeader(1, 0, type, IpcFrameFlags.None, (uint)payload.Length, requestId, sessionId), payload);
+    private static IpcFrame Request(
+        IpcMessageType type,
+        ulong requestId,
+        ulong sessionId,
+        byte[] payload,
+        ushort minorVersion = 0) =>
+        new(new IpcFrameHeader(1, minorVersion, type, IpcFrameFlags.None,
+            (uint)payload.Length, requestId, sessionId), payload);
+
+    private static byte[] BindPayload(string path)
+    {
+        byte[] pathBytes = Encoding.UTF8.GetBytes(path);
+        var payload = new byte[2 + pathBytes.Length];
+        BinaryPrimitives.WriteUInt16LittleEndian(payload, (ushort)pathBytes.Length);
+        pathBytes.CopyTo(payload, 2);
+        return payload;
+    }
 
     private static BrokerResult Result(IpcFrame response) =>
         (BrokerResult)BinaryPrimitives.ReadInt32LittleEndian(response.Payload);
@@ -167,7 +262,25 @@ public sealed class BrokerRequestDispatcherTests
             Coordinator = new BrokerSessionCoordinator(clock);
             runtime = new EffectRuntime(Coordinator, clock, new NullForceFeedbackOutputSink());
             runtime.Start();
-            Dispatcher = new BrokerRequestDispatcher(Coordinator, runtime, deviceReady);
+            Dispatcher = new BrokerRequestDispatcher(
+                Coordinator, runtime, _ => deviceReady(), deviceReady, static () => [], static _ => false);
+        }
+
+        public RuntimeFixture(Func<string, bool> bindDevice)
+            : this(bindDevice, static () => [], static _ => false)
+        {
+        }
+
+        public RuntimeFixture(
+            Func<string, bool> bindDevice,
+            Func<IReadOnlyList<WheelCandidateInfo>> candidates,
+            Func<ulong, bool> select)
+        {
+            var clock = new QpcMonotonicClock();
+            Coordinator = new BrokerSessionCoordinator(clock);
+            runtime = new EffectRuntime(Coordinator, clock, new NullForceFeedbackOutputSink());
+            runtime.Start();
+            Dispatcher = new BrokerRequestDispatcher(Coordinator, runtime, bindDevice, candidates, select);
         }
 
         public BrokerRequestDispatcher Dispatcher { get; }

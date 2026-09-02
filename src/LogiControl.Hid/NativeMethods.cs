@@ -69,6 +69,34 @@ internal static partial class NativeMethods
         internal ushort NumberFeatureDataIndices;
     }
 
+    [StructLayout(LayoutKind.Explicit, Size = 72)]
+    internal struct HidpValueCaps
+    {
+        [FieldOffset(0)] internal ushort UsagePage;
+        [FieldOffset(2)] internal byte ReportId;
+        [FieldOffset(3)] internal byte IsAlias;
+        [FieldOffset(4)] internal ushort BitField;
+        [FieldOffset(6)] internal ushort LinkCollection;
+        [FieldOffset(8)] internal ushort LinkUsage;
+        [FieldOffset(10)] internal ushort LinkUsagePage;
+        [FieldOffset(12)] internal byte IsRange;
+        [FieldOffset(13)] internal byte IsStringRange;
+        [FieldOffset(14)] internal byte IsDesignatorRange;
+        [FieldOffset(15)] internal byte IsAbsolute;
+        [FieldOffset(16)] internal byte HasNull;
+        [FieldOffset(18)] internal ushort BitSize;
+        [FieldOffset(20)] internal ushort ReportCount;
+        [FieldOffset(32)] internal uint UnitsExponent;
+        [FieldOffset(36)] internal uint Units;
+        [FieldOffset(40)] internal int LogicalMinimum;
+        [FieldOffset(44)] internal int LogicalMaximum;
+        [FieldOffset(48)] internal int PhysicalMinimum;
+        [FieldOffset(52)] internal int PhysicalMaximum;
+        [FieldOffset(56)] internal ushort UsageMinimum;
+        [FieldOffset(58)] internal ushort UsageMaximum;
+        [FieldOffset(56)] internal ushort Usage;
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     internal readonly record struct DevPropKey(Guid FormatId, uint PropertyId);
 
@@ -177,6 +205,16 @@ internal static partial class NativeMethods
         IntPtr preparsedData,
         byte[] report,
         uint reportLength);
+
+    [DllImport("hid.dll")]
+    internal static extern int HidP_GetSpecificValueCaps(
+        int reportType,
+        ushort usagePage,
+        ushort linkCollection,
+        ushort usage,
+        [Out] HidpValueCaps[] valueCaps,
+        ref ushort valueCapsLength,
+        IntPtr preparsedData);
 
     [LibraryImport("hid.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

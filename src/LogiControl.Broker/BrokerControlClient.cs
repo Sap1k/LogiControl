@@ -104,6 +104,28 @@ public sealed class BrokerControlClient : IAsyncDisposable
     public async ValueTask EmergencyStopAsync(CancellationToken cancellationToken = default) =>
         EnsureOk(await SendAsync(IpcMessageType.EmergencyStop, [], cancellationToken).ConfigureAwait(false));
 
+    public async ValueTask<IReadOnlyList<WheelCandidateInfo>> QueryWheelCandidatesAsync(
+        CancellationToken cancellationToken = default)
+    {
+        IpcFrame response = await SendAsync(IpcMessageType.QueryWheelCandidates, [], cancellationToken)
+            .ConfigureAwait(false);
+        ReadOnlySpan<byte> payload = EnsureOk(response, expectedExtraLength: null);
+        if (!WheelCandidateCodec.TryDecode(payload, out IReadOnlyList<WheelCandidateInfo>? candidates) ||
+            candidates is null)
+        {
+            throw new InvalidDataException("Broker returned a malformed wheel-candidate list.");
+        }
+
+        return candidates;
+    }
+
+    public async ValueTask SelectWheelAsync(ulong deviceId, CancellationToken cancellationToken = default)
+    {
+        var payload = new byte[sizeof(ulong)];
+        BinaryPrimitives.WriteUInt64LittleEndian(payload, deviceId);
+        EnsureOk(await SendAsync(IpcMessageType.SelectWheel, payload, cancellationToken).ConfigureAwait(false));
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (pipe.IsConnected && sessionId != 0)
@@ -157,9 +179,10 @@ public sealed class BrokerControlClient : IAsyncDisposable
         return response;
     }
 
-    private static ReadOnlySpan<byte> EnsureOk(IpcFrame response, int expectedExtraLength = 0)
+    private static ReadOnlySpan<byte> EnsureOk(IpcFrame response, int? expectedExtraLength = 0)
     {
-        if (response.Payload.Length != 4 + expectedExtraLength)
+        if (response.Payload.Length < 4 ||
+            expectedExtraLength is int expected && response.Payload.Length != 4 + expected)
         {
             throw new InvalidDataException("Broker returned an unexpected response payload length.");
         }

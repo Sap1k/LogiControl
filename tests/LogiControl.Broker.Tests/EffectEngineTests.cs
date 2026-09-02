@@ -223,12 +223,20 @@ public sealed class EffectEngineTests
             Common = Common(EffectCommon.InfiniteDuration) with { Gain = 8_000 },
             PositiveCoefficient = 10_000,
         };
-        engine.SetRuntimeSettings(RuntimeSettings.Default with { SpringGain = 5_000, MasterGain = 5_000 });
+        engine.SetRuntimeSettings(RuntimeSettings.Default with { SpringGain = 10_000, MasterGain = 5_000 });
         engine.SetGameGain(5_000);
         engine.Upsert(0, condition, false, out uint handle);
         engine.Start(handle);
         Assert.True(engine.TryDequeueConditionChange(out ConditionSlotChange change));
-        Assert.Equal(1_000, change.Definition!.PositiveCoefficient);
+        Assert.Equal(2_000, change.Definition!.PositiveCoefficient);
+        Assert.Equal(2_000, change.Definition.PositiveSaturation);
+
+        engine.SetRuntimeSettings(RuntimeSettings.Default with { SpringGain = 5_000, MasterGain = 5_000 });
+
+        Assert.True(engine.TryDequeueConditionChange(out ConditionSlotChange refreshed));
+        Assert.Equal(ConditionChangeKind.Update, refreshed.Change);
+        Assert.Equal(2_000, refreshed.Definition!.PositiveCoefficient);
+        Assert.Equal(1_000, refreshed.Definition.PositiveSaturation);
     }
 
     [Fact]

@@ -35,6 +35,24 @@ public static class BrokerCliCommand
                 Console.WriteLine(JsonSerializer.Serialize(
                     await client.QueryTelemetryAsync(cancellationToken).ConfigureAwait(false), JsonOptions));
                 return 0;
+            case "devices":
+                Console.WriteLine(JsonSerializer.Serialize(
+                    await client.QueryWheelCandidatesAsync(cancellationToken).ConfigureAwait(false), JsonOptions));
+                return 0;
+            case "select":
+                if (arguments.Length != 2)
+                {
+                    throw new ArgumentException("Select requires a device ID or 'auto'.");
+                }
+
+                ulong deviceId = arguments[1].Equals("auto", StringComparison.OrdinalIgnoreCase)
+                    ? 0
+                    : ulong.TryParse(arguments[1], out ulong parsed) && parsed != 0
+                        ? parsed
+                        : throw new ArgumentException("Device ID must be a positive integer or 'auto'.");
+                await client.SelectWheelAsync(deviceId, cancellationToken).ConfigureAwait(false);
+                Console.WriteLine(deviceId == 0 ? "Automatic wheel selection enabled." : $"Selected wheel {deviceId}.");
+                return 0;
             case "settings":
                 return await SettingsAsync(client, arguments[1..], cancellationToken).ConfigureAwait(false);
             case "emergency-stop":

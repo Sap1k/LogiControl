@@ -39,3 +39,15 @@ The Phase 2 engine and runtime independently express behavior studied from
 slot division, class gains, native friction, inertia mapping, timing, and
 backpressure. The repository is GPL-3.0-or-later; relevant source headers and
 `docs/protocol-sources.md` retain the pinned GPL-2.0-or-later provenance.
+
+The Phase 3 classic-wheel catalog and protocol independently express the
+DFGT/G27/G25/Driving Force Pro revision matchers, presentation switches,
+steering-range strategies, autocenter, friction capability, and common
+four-slot report behavior studied from the same pinned `new-lg4ff` commit.
+No Linux driver structures were copied; golden vectors and source headers retain
+the provenance of the behavior.
+
+The active Phase 3 constant-force encoder independently expresses the pinned
+`new-lg4ff` direct `0x00` slot encoding for every catalog wheel. The earlier
+DFGT Control `0x08` variable-force encoding is retained only as documented
+Phase 1 provenance and hardware evidence; it is not implemented as a fallback.

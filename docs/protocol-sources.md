@@ -39,3 +39,25 @@ Phase 2 provenance details:
   copied into the ABI or IPC.
 - DirectInput structure/mask/waveform semantics are normative from Microsoft;
   upstream behavior is corrected where it conflicts with DirectInput.
+
+Phase 3 provenance details:
+
+- The DFGT/G27/G25/DFP revision matchers, preferred presentations, EXT_CMD1,
+  EXT_CMD9, EXT_CMD16, DFP discrete 200°/900° range behavior, shared `F8 81`
+  range behavior, classic autocenter, native-friction capability, and
+  inertia-to-damper mapping were independently expressed from the pinned
+  `new-lg4ff` source and locked by golden vectors.
+- The active family-wide constant-force strategy uses the pinned source's
+  direct `0x00` encoding and selected-slot byte placement. There is no `0x08`
+  encoder or fallback branch; the former DFGT Control variable-force packet is
+  retained only as documented Phase 1 provenance and hardware evidence.
+- DFP runtime range validation and encoding deliberately expose only 200° and
+  900°. No intermediate packet generator is retained because the Linux
+  implementation couples such ranges to input-axis rescaling that this
+  non-interposing userspace architecture cannot perform.
+- Condition class gain follows the pinned behavior at the report boundary: it
+  reduces saturation without changing coefficient slope. Active condition
+  reports are refreshed when a gain setting changes.
+- The resulting implementation is a family protocol with data-driven
+  definitions. It does not copy Linux driver structures and does not introduce
+  a model-specific Windows driver or runtime.

@@ -1,7 +1,9 @@
-# DFGT vertical-slice development runbook
+# Classic-wheel development runbook
 
-This runbook is for the single-wheel DFGT development path. It does not claim
-support for another physical model or an unknown C294 revision.
+The physical results in this runbook are historical DFGT evidence. The current
+broker has automated-test-only definitions for DFGT, G27, G25, and Driving
+Force Pro and manages only one selected wheel at a time. Unknown revisions are
+always read-only.
 
 ## Build
 
@@ -32,7 +34,8 @@ Preview in a normal shell:
 ```
 
 Then run the same script from an elevated PowerShell without `-WhatIf`.
-Registration applies only to C29A, backs up existing registry branches, and
+Registration applies to C29A, C29B, C299, and C298, backs up existing registry
+branches before mutation, and
 records `artifacts/development-registration.json`.
 
 To remove it from an elevated shell and restore captured registry branches:
@@ -47,9 +50,11 @@ To remove it from an elevated shell and restore captured registry branches:
 .\tools\run\Start-Development.ps1
 ```
 
-For C294, the broker automatically sends the two native-mode reports after
-revision validation. For C29A, it attaches directly. Ctrl+C triggers
-StopAll, closes output, and terminates the development broker.
+For a single recognized lower presentation, the broker calibrates and sends the
+catalogued preferred-mode sequence after revision validation. It attaches
+directly to a recognized preferred presentation. With multiple candidates it
+remains read-only until `select <device-id>` is used. Ctrl+C triggers StopAll,
+closes output, and terminates the development broker.
 
 For provider parsing/IPC acceptance without physical enumeration or output,
 use `Start-Development.ps1 -FakeHid`. Add `-Profile` only for per-event
@@ -59,6 +64,9 @@ From another shell, query or control the running broker with:
 
 ```powershell
 dotnet run --project .\src\LogiControl.Broker -c Release -- status
+dotnet run --project .\src\LogiControl.Broker -c Release -- devices
+dotnet run --project .\src\LogiControl.Broker -c Release -- select auto
+dotnet run --project .\src\LogiControl.Broker -c Release -- select 1
 dotnet run --project .\src\LogiControl.Broker -c Release -- telemetry
 dotnet run --project .\src\LogiControl.Broker -c Release -- settings
 dotnet run --project .\src\LogiControl.Broker -c Release -- emergency-stop

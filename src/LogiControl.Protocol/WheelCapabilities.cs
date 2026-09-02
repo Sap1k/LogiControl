@@ -10,4 +10,5 @@ public enum WheelCapabilities
     SteeringRange = 1 << 1,
     Autocenter = 1 << 2,
     ForceFeedback = 1 << 3,
+    NativeFriction = 1 << 4,
 }

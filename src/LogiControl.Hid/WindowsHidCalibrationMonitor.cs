@@ -9,7 +9,6 @@ namespace LogiControl.Hid;
 
 public sealed class WindowsHidCalibrationMonitor : IHidCalibrationMonitor
 {
-    private const ushort LogitechCompatibilityModeProductId = 0xC294;
     private const int HidpInput = 0;
     private const int HidpStatusSuccess = 0x00110000;
     private static readonly TimeSpan StableCenterDuration = TimeSpan.FromMilliseconds(350);
@@ -48,18 +47,14 @@ public sealed class WindowsHidCalibrationMonitor : IHidCalibrationMonitor
 
         try
         {
+            (uint logicalMinimum, uint logicalMaximum) = ReadSteeringLogicalBounds(preparsedData);
             await using var stream = new FileStream(
                 handle,
                 FileAccess.Read,
                 device.InputReportByteLength,
                 isAsync: true);
             var report = new byte[device.InputReportByteLength];
-            // The DFGT presents a 10-bit X axis in C294 compatibility mode and
-            // a 14-bit X axis after switching to C29A. Calibration is observed
-            // before the switch, so use the compatibility collection's scale.
-            var tracker = device.ProductId == LogitechCompatibilityModeProductId
-                ? new SteeringCalibrationTracker(0, 1023)
-                : new SteeringCalibrationTracker(0, 16383);
+            var tracker = new SteeringCalibrationTracker(logicalMinimum, logicalMaximum);
             long startedAt = Stopwatch.GetTimestamp();
             using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeoutSource.CancelAfter(timeout);
@@ -132,5 +127,39 @@ public sealed class WindowsHidCalibrationMonitor : IHidCalibrationMonitor
         {
             NativeMethods.HidD_FreePreparsedData(preparsedData);
         }
+    }
+
+    private static (uint Minimum, uint Maximum) ReadSteeringLogicalBounds(IntPtr preparsedData)
+    {
+        int status = NativeMethods.HidP_GetCaps(preparsedData, out NativeMethods.HidpCaps capabilities);
+        if (status != HidpStatusSuccess || capabilities.NumberInputValueCaps == 0)
+        {
+            throw new InvalidDataException($"HidP_GetCaps failed with HID status 0x{status:X8}.");
+        }
+
+        ushort count = capabilities.NumberInputValueCaps;
+        var valueCaps = new NativeMethods.HidpValueCaps[count];
+        status = NativeMethods.HidP_GetSpecificValueCaps(
+            HidpInput,
+            0x01,
+            0,
+            0x30,
+            valueCaps,
+            ref count,
+            preparsedData);
+        if (status != HidpStatusSuccess || count == 0)
+        {
+            throw new InvalidDataException(
+                $"The HID descriptor does not expose a steering X-axis value capability (status 0x{status:X8}).");
+        }
+
+        NativeMethods.HidpValueCaps steering = valueCaps[0];
+        if (steering.LogicalMinimum < 0 || steering.LogicalMaximum <= steering.LogicalMinimum)
+        {
+            throw new InvalidDataException(
+                $"Unsupported steering logical bounds {steering.LogicalMinimum}..{steering.LogicalMaximum}.");
+        }
+
+        return ((uint)steering.LogicalMinimum, (uint)steering.LogicalMaximum);
     }
 }

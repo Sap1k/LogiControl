@@ -9,7 +9,7 @@ if (args.FirstOrDefault()?.Equals("profile-runtime", StringComparison.OrdinalIgn
 }
 
 string? command = args.FirstOrDefault()?.ToLowerInvariant();
-if (command is "list" or "status" or "telemetry" or "settings" or "emergency-stop")
+if (command is "list" or "devices" or "select" or "status" or "telemetry" or "settings" or "emergency-stop")
 {
     return await BrokerCliCommand.RunAsync(args);
 }
@@ -23,7 +23,8 @@ if (serverArguments.Any(argument => !argument.Equals("--fake-hid", StringCompari
 {
     Console.Error.WriteLine(
         "Usage: LogiControl.Broker [serve] [--fake-hid] [--profile] | " +
-        "list [--json] | status | telemetry | settings [options] | emergency-stop | " +
+        "list [--json] | devices | select <device-id|auto> | status | telemetry | " +
+        "settings [options] | emergency-stop | " +
         "profile-runtime [--seconds N] [--runs N] [--stress]");
     return 2;
 }
@@ -56,10 +57,9 @@ if (!fakeHid)
         profileEvents: profile);
 }
 
-var server = new SemanticPipeServer(
-    coordinator,
-    runtime,
-    fakeHid ? () => true : () => deviceManager!.IsDeviceReady);
+var server = fakeHid
+    ? new SemanticPipeServer(coordinator, runtime, deviceReady: true)
+    : new SemanticPipeServer(coordinator, runtime, deviceManager!);
 
 Console.WriteLine($"LogiControl Broker listening on {BrokerConstants.PipeName}.");
 Console.WriteLine(fakeHid
